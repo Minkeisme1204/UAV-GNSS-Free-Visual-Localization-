@@ -1,0 +1,9 @@
+.docs
+.thirdparty/*
+data/*
+config/*
+.vscode
+.lib/*
+.local/*
+build/*
+.repo
