@@ -1,0 +1,34 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(./tests/test_vo)",
+      "WebSearch",
+      "WebFetch(domain:koide3.github.io)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:gist.github.com)",
+      "Bash(pkg-config --libs fmt)"
+    ]
+  },
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "notify-send -a 'Claude Code' 'Claude Code ✅' 'Task complete — ready for your input' 2>/dev/null; paplay /usr/share/sounds/freedesktop/stereo/complete.oga 2>/dev/null; true"
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "MSG=$(python3 -c \"import sys,json;s=sys.stdin.read().strip();d=json.loads(s) if s else {};print(d.get('message','Claude needs your input'))\" 2>/dev/null); notify-send -u critical -a 'Claude Code' 'Claude Code ❓' \"$MSG\" 2>/dev/null; paplay /usr/share/sounds/freedesktop/stereo/message.oga 2>/dev/null; true"
+          }
+        ]
+      }
+    ]
+  }
+}
