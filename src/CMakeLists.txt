@@ -24,7 +24,7 @@ add_subdirectory(sensor)
 add_subdirectory(util)
 add_subdirectory(new_vo)   # VoFrameLoader subset enabled (feature/orb + data/ + camera adapter)
 # add_subdirectory(vpr)
-# add_subdirectory(fusion)   # also link GTSAM in root CMakeLists first
+add_subdirectory(fusion)   # GTSAM back-end (links gtsam PRIVATE in src/fusion/)
 # add_subdirectory(anchor)
 # add_subdirectory(core)
 # add_subdirectory(utils)

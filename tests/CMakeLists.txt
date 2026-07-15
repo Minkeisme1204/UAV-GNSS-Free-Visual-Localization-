@@ -155,6 +155,16 @@ add_test(NAME test_vo_debug COMMAND test_vo_debug)
 
 endif()  # old vo module present
 
+# ── fusion smoke (F1 skeleton: threading + GTSAM linkage, synthetic input) ────
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_fusion_smoke.cpp)
+    add_executable(test_fusion_smoke test_fusion_smoke.cpp)
+    target_link_libraries(test_fusion_smoke PRIVATE uavloc)
+    set_target_properties(test_fusion_smoke PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${TEST_OUTPUT_DIR}
+    )
+    add_test(NAME test_fusion_smoke COMMAND test_fusion_smoke)
+endif()
+
 # ── MPEG-TS reader: H.264 video + MISB ST 0601 KLV telemetry ─────────────────
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_ts_reader.cpp)
     add_executable(test_ts_reader test_ts_reader.cpp)
