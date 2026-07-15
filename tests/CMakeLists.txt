@@ -165,6 +165,20 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_fusion_smoke.cpp)
     add_test(NAME test_fusion_smoke COMMAND test_fusion_smoke)
 endif()
 
+# ── fusion factors (F1: drift-recovery on synthetic corrupted VO) ────────────
+# Includes the private src/fusion/factors.h (attitude chain + yaw helpers), so
+# it needs the src include dir and a direct gtsam link (gtsam is PRIVATE on
+# uavloc by design — the public API stays gtsam-free).
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_fusion_factors.cpp)
+    add_executable(test_fusion_factors test_fusion_factors.cpp)
+    target_link_libraries(test_fusion_factors PRIVATE uavloc gtsam)
+    target_include_directories(test_fusion_factors PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    set_target_properties(test_fusion_factors PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${TEST_OUTPUT_DIR}
+    )
+    add_test(NAME test_fusion_factors COMMAND test_fusion_factors)
+endif()
+
 # ── MPEG-TS reader: H.264 video + MISB ST 0601 KLV telemetry ─────────────────
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_ts_reader.cpp)
     add_executable(test_ts_reader test_ts_reader.cpp)

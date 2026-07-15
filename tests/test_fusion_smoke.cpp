@@ -15,6 +15,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include <cmath>
 #include <vector>
 
 namespace {
@@ -25,6 +26,9 @@ constexpr double FRAME_DT_MSEC     = 40.0;
 constexpr double STEP_X_M          = 1.0;  // straight-line motion, 1 m/frame in X
 constexpr double TELEM_ALTITUDE_M  = 800.0;
 constexpr double TELEM_HEADING_DEG = 90.0;
+// With the F1 factors the ENU anchor sits at (0, 0, agl_0) and the AGL factor
+// pins Z, so every fused pose must stay near the telemetry altitude.
+constexpr double Z_ANCHOR_TOL_M = 50.0;
 
 uavloc::vo::VOResult make_vo_result(int i) {
     uavloc::vo::VOResult res;
@@ -106,6 +110,12 @@ bool check_outcome(const FeedOutcome& outcome, const char* label) {
     }
     if (!outcome.latest.T_enu_c.matrix().allFinite()) {
         spdlog::error("[{}] latest() pose is not finite", label);
+        ok = false;
+    }
+    const double z_last = outcome.latest.T_enu_c.translation().z();
+    if (std::abs(z_last - TELEM_ALTITUDE_M) > Z_ANCHOR_TOL_M) {
+        spdlog::error("[{}] latest() z={:.1f} m not anchored near AGL {:.1f} m",
+                      label, z_last, TELEM_ALTITUDE_M);
         ok = false;
     }
     return ok;
