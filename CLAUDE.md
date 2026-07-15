@@ -34,7 +34,7 @@ uav_localization/
 | Module         | Status | Key files |
 |----------------|--------|-----------|
 | `sensor`       | Active | `data_interface.h`, `frame_data.h`, `telemetry_data.h`, `video_reader.h`, `camera_streamer.h`, `camera_model.h`, `sensor_factory.h` |
-| `vo`           | Active (refactor in progress) | `vo_data.h`, `feature_detector.h`, `projection_matcher.h`, `pose_estimator.h`, `frame_sequence.h` (placeholder: `local_optimizer.h`) |
+| `vo`           | Active (implemented; multi-thread Phase A) | `common.h` (all types), `tracking.h` (ProjectionMatcher+Tracker), `vo_module.h`, `feature_detector.h`, `pose_estimator.h`, `local_optimizer.h`; private: `local_map.h`, `local_mapper.h`, `initializer.h`, `frame_queue.h` |
 | `debug_viewer` | Active | `debug_viewer.h`, `debug_viewer_callbacks.h`, `callback_slot.h`, `telemetry_record.h`, `telemetry_csv_reader.h`, `trajectory_viewer.h` |
 | `vpr`          | Stub   | — |
 | `fusion`       | Stub   | — (needs GTSAM) |
@@ -72,79 +72,82 @@ timestamp_msec,frame_id,heading_deg,pitch_deg,roll_deg,latitude_deg,longitude_de
 
 ---
 
-## VO Module (refactor in progress)
+## VO Module (implemented; multi-thread Phase A shipped)
 
-> **Current state (on disk).** The module is being rebuilt around small,
-> independently-testable stages. The pipeline/Public-API described further below
-> is the **design target** (see `.docs/designs/vo_design.md`); several of those
-> classes (`VOModule`, `Initializer`, `PoseOptimizer`, `LocalMap`, …) are not yet
-> present. What exists today:
->
-> - **`vo_data.h`** — shared types: `FeatureSet` (`keypoints`, `descriptors`,
->   `DescriptorType`), `MatchesData` (`matches`, `inliers`, `inlier_mask`,
->   `num_matches`, `num_inliers`, `inlier_ratio`), `VOPoseData`
->   (`R_L_C`, `t_L_C`, `T_prev_curr`), and the status enums `FeatureStatus`,
->   `MatchStatus`, `VOTrackingState` (`NOT_INITIALIZED`, `INITIALIZED`,
->   `TRACKING`, `LOST`, `FAILED`), and `VOFailureReason` (`NONE`,
->   `NOT_ENOUGH_FEATURES`, `NOT_ENOUGH_MATCHES`, `NOT_ENOUGH_INLIERS`,
->   `POSE_ESTIMATION_FAILED`). (`PoseStatus` lives in `pose_estimator.h`,
->   not `vo_data.h`.)
-> - **`feature_detector.h`** — `IFeatureDetector` + `createFeatureDetector()`;
->   ORB (`ORB_OPENCV`) and `FAST_ONLY` backends; `FeatureDetectorConfig::fromYaml`.
-> - **`projection_matcher.h`** — `ProjectionMatcher` (Hamming BF + Lowe ratio +
->   orientation/optional GMS filters); fills `matches`, leaves inliers for the
->   pose stage; `ProjectionMatcherConfig::fromYaml`.
-> - **`pose_estimator.h`** — `PoseEstimator`: consumes `MatchesData` and recovers
->   the relative pose **homography-first** via `cv::findHomography` (RANSAC) +
->   `cv::decomposeHomographyMat` with a nadir-aware solution selector (ground
->   normal ≈ optical axis). Writes inliers back into `MatchesData`, outputs
->   `VOPoseData`; translation is **up-to-scale** (monocular). Optional
->   essential-matrix fallback for non-planar/high-parallax. `PoseEstimatorConfig::fromYaml`
->   (YAML key `PoseEstimator:` under `VO:`). Implementation (`pose_estimator.cpp`,
->   318 LOC) is complete: homography RANSAC seeded `0xABCD1234`, a nadir-aware
->   `cv::decomposeHomographyMat` solution selector, inlier writeback into
->   `MatchesData`, and an essential-matrix fallback seeded `0x5678EF00`.
-> - **`frame_sequence.h`** — frame buffering for two-view processing.
-> - Placeholder (empty header): `local_optimizer.h`. (`motion_estimator.h` has
->   been removed.)
->
-> Current two-view data flow: `FeatureDetector → ProjectionMatcher → PoseEstimator`.
-> NOTE: vo headers currently use `#ifndef` guards except `pose_estimator.h`, which
-> follows the `#pragma once` coding rule.
+> **Current state (on disk, 2026-07-11).** The full pipeline is implemented and the
+> header layout has been reorganised. All VO **data types** (structs/enums) live in a
+> single **`include/uavloc/vo/common.h`**; **`ProjectionMatcher` + `Tracker`** (with
+> their configs) are bundled into public **`include/uavloc/vo/tracking.h`**. The old
+> `vo_data.h`, `projection_matcher.h`, `src/vo/tracker.h`, `src/vo/local_map_types.h`,
+> and `frame_sequence.{h,cpp}` have been **removed**. Config structs stay next to their
+> owning class. `.claude/rules/coding.md` carries a VO exemption allowing common.h /
+> tracking.h to expose internal types (`Landmark`, `Keyframe`, `KeyframePacket`, `Tracker`).
 
-### Public API (design target)
-- **`VOModule`** — pimpl class; `start()` / `stop()` control the tracking thread; `pushFrame(FrameData)` enqueues a frame (returns `false` on drop); `currentState()` returns `TrackingState`; three callback setters: `setVOResultCallback()`, `setKeyframeCallback()`, `setStatusCallback()`.
-- **`VOResultCallback`** — `std::function<void(const VOResult&)>` fired on every processed frame.
-- **`KeyframeCallback`** — `std::function<void(const KeyframePacket&)>` fired when a new keyframe is selected; feeds VPR downstream.
-- **`StatusCallback`** — `std::function<void(TrackingState, const std::string&)>` fired on state transitions.
+### Header layout (current)
+- **`include/uavloc/vo/common.h`** — every data type: `FeatureSet`, `MatchesData`,
+  `VOPoseData`, `VOResult`, `Observation`, `Landmark` (non-copyable — holds
+  `std::atomic<int> num_visible/num_found`), `Keyframe`, `LandmarkSnapshot`,
+  `KeyframePacket`, and the enums `VOTrackingState` (`NOT_INITIALIZED | INITIALIZED |
+  TRACKING | LOST | FAILED`), `VOFailureReason`, `DescriptorType`, `FeatureStatus`,
+  `MatchStatus`, `FeatureBackend`, `PoseStatus`, `TrackStatus`, `InitStatus`, `LandmarkState`.
+- **`include/uavloc/vo/tracking.h`** — `ProjectionMatcher` (+`ProjectionMatcherConfig`)
+  and `Tracker` (+`TrackerConfig`); forward-declares `LocalMap`/`LocalMapper` (held by
+  ref), includes `common.h` + `local_optimizer.h`.
+- Other public headers: `feature_detector.h`, `pose_estimator.h`, `local_optimizer.h`,
+  `vo_module.h`. Private (`src/vo/`): `local_map.h`, `local_mapper.h`, `initializer.h`,
+  `frame_queue.h`.
 
-### Key data types
-- **`TrackingState`** — `enum class`: `NOT_INITIALIZED | INITIALIZING | TRACKING | LOST` (the enum actually implemented on disk is `VOTrackingState` in `vo_data.h`, with members `NOT_INITIALIZED | INITIALIZED | TRACKING | LOST | FAILED` — do not confuse the two)
-- **`VOResult`** — per-frame result: `frame_id`, `timestamp_msec`, `state`, `T_wc` (Eigen::Matrix4d), `T_prev_curr`, `has_pose`, `is_keyframe`, `num_keypoints`, `num_matches`, `num_inliers`, `inlier_ratio`, `mean_reproj_error`, `tracking_confidence`, `translation_from_last_kf`, `rotation_from_last_kf`
-- **`VOConfig`** — all tunable parameters loaded from YAML key `VO:` via `VOConfig::fromYaml(node)`; includes feature, RANSAC, keyframe, queue, and matching fields
-- **`KeyframePacket`** — carries keyframe image and pose to VPR
+### Public API
+- **`VOModule`** — pimpl (`include/uavloc/vo/vo_module.h`). **Synchronous default**:
+  `VOResult processFrame(const sensor::FrameData&)` — deterministic, bit-for-bit
+  reproducible (used by all tests/baseline). **Opt-in async mode** (`VOConfig::async_enabled`):
+  `start()` / `stop()` spawn the tracking + local-mapping threads; `bool pushFrame(FrameData)`
+  is non-blocking drop-oldest; results delivered via `setVOResultCallback()` (fires per
+  frame, in frame order, on the tracking thread — **non-deterministic**). Also
+  `setStatusCallback()` / `setKeyframeCallback()`.
+- **`VOResult`** — per-frame: `frame_id`, `timestamp_msec`, `state` (`VOTrackingState`),
+  `T_wc` (GLOBAL camera→world), `T_prev_curr` (GLOBAL increment), `has_pose`, `is_keyframe`,
+  `num_keypoints`, `num_matches`, `num_inliers`, `num_landmarks`, `inlier_ratio`,
+  `tracked_observations`. (`num_matches`/`inlier_ratio` are filled in BOTH init and tracking.)
+- **`VOConfig`** — `VOConfig::fromYaml(node["VO"])`; embeds `FeatureDetectorConfig`,
+  `ProjectionMatcherConfig`, `PoseEstimatorConfig`, plus `async_enabled`,
+  `frame_queue_capacity`, `frame_queue_pop_timeout_ms`, `off_nadir_source`, `reinit_refresh_frames`,
+  and a raw `YAML::Node vo_node` used to build the private Tracker/Initializer/LocalMapper configs.
 
-### Pipeline overview (design target)
+### Pipeline (current, two threads in async mode)
 ```
-FrameQueue → Preprocessor (undistort) → FeatureExtractor (ORB)
-  ├─ [NOT_INITIALIZED] Initializer: parallel H/F RANSAC → triangulation → seed map
-  └─ [TRACKING] ProjectionMatcher → PnP (solvePnPRansac) → PoseOptimizer
-                → KeyframeManager (insertion policy)
-                → LocalMap (cullLandmarks on keyframe)
+FrameQueue → Tracking thread: detect(ORB) → [NOT_INITIALIZED] Initializer (homography-first
+             two-view, parallax-gated, metric seed from altitude)  |  [TRACKING] project
+             LocalMap landmarks → ProjectionMatcher → solvePnPRansac → PoseOptimizer
+             (motion-only BA) → keyframe gate → submit KeyframePacket
+                                                       │
+Local Mapping thread ←──── KeyframePacket ────────────┘
+             insert KF + observations → triangulateNewLandmarks (1-ref) → cullLandmarks
 ```
+In synchronous mode the same steps run inline on the calling thread (no threads spawned).
 
-### Internal components (design target — `src/vo/`)
-- **`VOModuleImpl`** — tracking thread, state machine, full pipeline orchestration
-- **`FrameQueue`** — bounded MPSC queue; drop-oldest policy; configurable capacity
-- **`Initializer`** — parallel H/F RANSAC on two threads; nadir-aware H decomposition (surface-normal tiebreaker); triangulates seed map
-- **`MotionModel`** — constant-velocity SE3 twist; `predict(T_wc_last, frame_gap)` scales twist by gap
-- **`PoseOptimizer`** — `cv::solvePnPRansac` placeholder (TODO: replace with g2o BA)
-- **`ProjectionMatcher`** — landmark projection + Hamming match + Lowe ratio test + `kp_assigned[]` deduplication guard
-- **`LocalMap`** — landmark/keyframe store; `cullLandmarks()` marks bad if `obs_count < 2` or `num_found/num_visible < 0.25`
-- **`KeyframeManager`** — insertion policy: frame gap, inlier ratio, and tracked-landmark count thresholds
-- **`Preprocessor`** — optional per-frame undistortion using `CameraModel`
-- **`FeatureSet`** (header-only) — internal struct: `keypoints`, `descriptors`, `normalized_pts`
-- **`Landmark`** (header-only) — internal struct: `id`, `pos_w`, `descriptor`, `obs_count`, `num_visible`, `num_found`, `bad`
+### Internal components (`src/vo/`)
+- **`VOModule::Impl`** — state machine (`NOT_INITIALIZED→INITIALIZED→TRACKING`, LOST weld/re-init),
+  `T_world_anchor` welding, `metricScaleFromTelemetry`, async thread orchestration.
+- **`Initializer`** — holds first frame as fixed reference, accumulates parallax, `tryInitialize`
+  → homography pose (metric scale from altitude) → `cv::triangulatePoints` → seeds `LocalMap`.
+- **`Tracker`** — constant-velocity motion model → project landmarks → `ProjectionMatcher` →
+  `cv::solvePnPRansac` → `PoseOptimizer`; keyframe gate (SVO depth-normalized `d/depth`).
+- **`LocalMapper`** — runs on the mapping thread; `triangulateNewLandmarks` + `cullLandmarks`;
+  owns its own `ProjectionMatcher`. `KeyframePacket` is the thread-boundary hand-off.
+- **`LocalMap`** — `unordered_map` of `Landmark`/`Keyframe` (shared_ptr, id-keyed), guarded by
+  `map_mutex_`; atomic id counters; `snapshotLandmarks()` for lock-free tracking reads;
+  `cullLandmarks()` marks bad if `obs_count < 2` or `num_found/num_visible < 0.25`.
+- **`PoseOptimizer`** (`local_optimizer.{h,cpp}`) — motion-only BA, Eigen-only (hand se3 exp,
+  Huber + per-frame MAD σ, landmarks fixed). Not g2o.
+- **`FrameQueue`** — bounded, drop-oldest, mutex+CV (async input queue).
+
+### Pending (design target, NOT yet on disk)
+- **Phase B — covisibility graph** (K1/K2 local-map selection, multi-ref triangulation).
+- **Phase C — multi-keyframe local Bundle Adjustment** (solver g2o-vs-GTSAM undecided).
+- **Per-point triangulation-angle gate** — currently absent; triangulation is gated only by
+  aggregate median PIXEL disparity (proxy) + per-point cheirality + reprojection, so
+  low-parallax landmarks (~0.086°/frame at 800 m) still enter the map.
 
 ### SE3 convention
 - `T_wc` = camera-to-world transform; first frame is identity.
@@ -164,8 +167,10 @@ Load via `VOConfig::fromYaml(node["VO"])`. All fields have defaults; missing key
 Key fields: `num_features`, `scale_levels`, `scale_factor`, `ini_fast_threshold`, `min_fast_threshold`, `min_parallax_deg`, `min_triangulated_pts`, `max_reproj_error_px`, `ransac_iterations`, `min_inliers_to_track`, `pose_opt_max_reproj_error_px`, `search_radius`, `kf_min_frame_gap`, `kf_min_inlier_ratio`, `kf_min_tracked_landmarks`, `frame_queue_capacity`, `undistort_image`, `descriptor_dist_threshold`, `lowe_ratio_threshold`, `ransac_reproj_threshold`, `pnp_iterations`, `pnp_confidence`, `frame_queue_pop_timeout_ms`.
 
 ### Known limitations
-- `PoseOptimizer` calls `cv::solvePnPRansac` directly; a proper g2o bundle-adjustment back-end is not yet integrated.
-- Monocular scale is inherently ambiguous; metric scale recovery requires altitude from telemetry or stereo.
+- Only **motion-only BA** exists (`PoseOptimizer`, landmarks fixed); no multi-keyframe local BA yet (Phase C).
+- No per-point triangulation-angle gate (see Pending above); low parallax (~0.086°/frame @800 m) yields noisy landmark depth → Z-drift.
+- Monocular scale is inherently ambiguous; metric scale seeded from altitude at init but drifts — a proper fix belongs in the `fusion` back-end (altitude prior + scale state), not front-end rescale (that was tried and failed).
+- Async mode is non-deterministic by design; deterministic baseline requires the synchronous `processFrame` path.
 
 ---
 
@@ -244,6 +249,19 @@ trajectory shape is qualitative, not metric. Headless-safe (no GUI).
 ```bash
 # From build/
 ./tests/test_vo_pipeline [config.yaml]   # default: config/uavloc_yenbai800m.yaml
+```
+
+### `test_vo_debug`
+Compact diagnostic: runs the first 20 valid frames through the packaged
+`VOModule::processFrame` (shares the same config as `test_vo_pipeline`), logs a full
+per-frame block (state, keypoints/matches/inliers/landmarks, `inlier_ratio`, `T_wc` and
+`T_prev_curr` translation, telemetry), and writes a top-down trajectory image
+`vo_debug_trajectory.png` (world X–Y, altitude dropped, heading arrows from `T_wc` rotation).
+Headless, synchronous.
+
+```bash
+# From build/
+./tests/test_vo_debug [config.yaml] [max_frames]   # default: config/uavloc_yenbai800m.yaml, 20
 ```
 
 ### `demo_debug_viewer`

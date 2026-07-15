@@ -11,6 +11,12 @@
 - Use `#pragma once` — not `#ifndef` include guards.
 - Correct OpenCV include: `#include <opencv2/opencv.hpp>` (not `cv2/opencv.hpp`).
 - Do not put implementation code in public headers unless it is a template.
+- **VO module exemption (by design decision):** `include/uavloc/vo/common.h` and
+  `include/uavloc/vo/tracking.h` are public headers that intentionally also carry
+  internal data types (`Landmark`, `Keyframe`, `KeyframePacket`, `LandmarkSnapshot`)
+  and the internal `Tracker` class, to centralise all VO type declarations in one
+  place. This is a deliberate override of the "implementation-only helpers stay in
+  `src/`" rule for the `vo` module only.
 
 ## Language and style
 - C++17 minimum.

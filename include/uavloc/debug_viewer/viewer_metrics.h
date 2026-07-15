@@ -17,4 +17,14 @@ struct FrameMetrics {
     float distance_m      = 0.0f;  // accumulated VO path length (metres)
 };
 
+// A single process-performance sample fed to the "Performance" streaming line
+// charts. The PRODUCER measures (e.g. the algorithm driver sampling
+// /proc/self); the viewer only plots — keeping the module decoupled from any
+// OS-specific measurement mechanism. POD only (no GL/ImGui involvement).
+struct PerfSample {
+    double t_sec       = 0.0;   // wall-clock seconds since the producer started
+    float  cpu_percent = 0.0f;  // process CPU usage; may exceed 100 with threads
+    float  rss_mb      = 0.0f;  // resident set size (MB)
+};
+
 } // namespace uavloc::debug_viewer

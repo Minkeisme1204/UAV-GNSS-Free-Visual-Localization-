@@ -32,6 +32,20 @@ endif()
 # find_package(GTSAM        REQUIRED)   # fusion module
 # find_package(onnxruntime  REQUIRED)   # vpr module
 
+# ── g2o (prebuilt in-tree, consumed by new_vo/optimize) ───────────────────────
+# g2o is already built under .thirdparty/g2o/build (headers in .thirdparty/g2o,
+# generated config.h in .thirdparty/g2o/build). Only the core + stuff shared libs
+# are produced (csparse/cholmod were unavailable at build time — see config.h),
+# so new_vo links the header-only Eigen linear solver.
+set(G2O_ROOT "${PROJECT_SOURCE_DIR}/.thirdparty/g2o")
+set(G2O_INCLUDE_DIRS "${G2O_ROOT}" "${G2O_ROOT}/build")
+set(G2O_LIB_DIR "${G2O_ROOT}/build/lib")
+foreach(_g2o_lib core stuff)
+    add_library(g2o::${_g2o_lib} SHARED IMPORTED)
+    set_target_properties(g2o::${_g2o_lib} PROPERTIES
+        IMPORTED_LOCATION "${G2O_LIB_DIR}/libg2o_${_g2o_lib}.so")
+endforeach()
+
 # ── Optional: debug_viewer (requires Iridescence) ─────────────────────────────
 # Iridescence and its bundled GLFW are installed under .local/.
 # glfw3 must be found first so that the "glfw" target exists when
@@ -51,6 +65,9 @@ endif()
 
 # ── Build options ─────────────────────────────────────────────────────────────
 option(BUILD_TESTING "Build test programs" ON)
+# ORB uses a scalar rotation path by default; the SSE3 fast path is opt-in and
+# requires an SSE3-capable x86 host (see feature/orb/orb_impl.cpp).
+option(USE_SSE_ORB "Enable the SSE3 fast path in the ORB extractor" OFF)
 
 # ── Library ───────────────────────────────────────────────────────────────────
 add_subdirectory(src)

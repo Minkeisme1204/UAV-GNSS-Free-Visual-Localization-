@@ -72,22 +72,66 @@ constexpr float INFERRED_COLOR[4] = {0.95f, 0.55f, 0.1f, 1.0f}; // orange
 constexpr float LOST_COLOR[4]           = {0.95f, 0.15f, 0.15f, 1.0f}; // red
 constexpr float LOST_MARKER_POINT_SCALE = 8.0f;
 
-// Draw a metric panel inside a resizable ImGui window: a per-frame line chart on
-// top and a value-distribution histogram below. Both plots fill the available
-// content region (ImVec2(-1, ...)) so they grow/shrink with the window.
+// Colour + screen-space point size for the VO map-point cloud (pushMapPoints).
+constexpr float MAP_POINT_COLOR[4]      = {0.40f, 0.70f, 1.00f, 1.0f}; // light blue
+constexpr float MAP_POINT_SCALE         = 4.0f;
+
+// Draw one auto-follow streaming line chart of `values` vs `xs`.
 //
 // Plotting backend: ImPlot is preferred (guik creates the ImPlot context for its
 // own plot API, so ImPlot::GetCurrentContext() is valid here). When no context
-// is present we fall back to ImGui core (PlotLines + a manually-binned
-// PlotHistogram); we never call ImPlot::CreateContext() ourselves, so there is no
-// risk of a duplicate-context crash. Render-thread only — all data is read from
-// the render-thread-owned ring buffers.
+// is present we fall back to ImGui core (PlotLines); we never call
+// ImPlot::CreateContext() ourselves, so there is no risk of a duplicate-context
+// crash. Render-thread only — all data is read from the render-thread-owned
+// ring buffers.
 //
-// Auto-follow: the line chart's X axis is slid every frame to show only the
-// newest `follow_window` samples (Y auto-fits), so the latest values are always
-// on screen without the user panning with the mouse. With ImPlot this is a hard
-// SetupAxisLimits(..., Always) on X + an AutoFit Y flag; the ImGui-core fallback
-// simply plots the trailing `follow_window`-sample slice.
+// Auto-follow: the X axis is slid every frame to show only the newest
+// `follow_window` SAMPLES (Y auto-fits), so the latest values are always on
+// screen without the user panning with the mouse. With ImPlot this is a hard
+// SetupAxisLimits(..., Always) on X + an AutoFit Y flag; the ImGui-core
+// fallback simply plots the trailing `follow_window`-sample slice.
+// `plot_id` must be unique within the enclosing window ("##line", "##cpu", ...).
+void drawStreamingLine(const char* plot_id, const char* x_label,
+                       const char* value_label,
+                       const std::vector<double>& xs,
+                       const std::vector<double>& values,
+                       int follow_window, float height) {
+    const int n      = static_cast<int>(values.size());
+    const int follow = std::max(1, follow_window);
+    if (n == 0) return;
+
+    if (ImPlot::GetCurrentContext() != nullptr) {
+        if (ImPlot::BeginPlot(plot_id, ImVec2(-1, height))) {
+            // Y auto-fits to the visible data; X is force-followed to the latest
+            // window every frame so the newest samples are always in view.
+            ImPlot::SetupAxes(x_label, value_label, 0, ImPlotAxisFlags_AutoFit);
+            const double x_last = xs.back();
+            double x_lo = xs[static_cast<std::size_t>((n > follow) ? (n - follow) : 0)];
+            if (x_last - x_lo < 1e-9) x_lo = x_last - 1.0;  // guard degenerate range
+            ImPlot::SetupAxisLimits(ImAxis_X1, x_lo, x_last, ImPlotCond_Always);
+            ImPlot::PlotLine(value_label, xs.data(), values.data(), n);
+            ImPlot::EndPlot();
+        }
+    } else {
+        // ImGui core fallback: needs float arrays. Auto-follow: plot only the
+        // trailing `follow`-sample slice so the newest values are always shown
+        // (ImGui::PlotLines otherwise draws the whole array squeezed to fit).
+        const double mn = *std::min_element(values.begin(), values.end());
+        const double mx = *std::max_element(values.begin(), values.end());
+        const int    start   = (n > follow) ? (n - follow) : 0;
+        const int    slice_n = n - start;
+        std::vector<float> vf(values.begin() + start, values.end());
+        ImGui::PlotLines(plot_id, vf.data(), slice_n, 0, value_label,
+                         static_cast<float>(mn), static_cast<float>(mx),
+                         ImVec2(-1, height));
+    }
+}
+
+// Draw a metric panel inside a resizable ImGui window: a per-frame line chart on
+// top (drawStreamingLine) and a value-distribution histogram below. Both plots
+// fill the available content region (ImVec2(-1, ...)) so they grow/shrink with
+// the window. Same ImPlot-preferred / ImGui-core-fallback policy as
+// drawStreamingLine (the histogram is manually binned in the fallback).
 void drawMetricWindow(const char* title, bool* open,
                       const std::vector<double>& frame_x,
                       const std::vector<double>& values,
@@ -111,40 +155,20 @@ void drawMetricWindow(const char* title, bool* open,
     const ImVec2 avail = ImGui::GetContentRegionAvail();
     const float  line_h = avail.y * 0.5f;
     const int    bins   = std::max(1, hist_bins);
-    const int    follow = std::max(1, follow_window);
+
+    drawStreamingLine("##line", "frame", value_label, frame_x, values,
+                      follow_window, line_h);
 
     if (ImPlot::GetCurrentContext() != nullptr) {
-        if (ImPlot::BeginPlot("##line", ImVec2(-1, line_h))) {
-            // Y auto-fits to the visible data; X is force-followed to the latest
-            // window every frame so the newest samples are always in view.
-            ImPlot::SetupAxes("frame", value_label, 0, ImPlotAxisFlags_AutoFit);
-            const double x_last = frame_x.back();
-            double x_lo = x_last - static_cast<double>(follow);
-            if (x_lo < frame_x.front()) x_lo = frame_x.front();
-            if (x_last - x_lo < 1.0) x_lo = x_last - 1.0;  // guard degenerate range
-            ImPlot::SetupAxisLimits(ImAxis_X1, x_lo, x_last, ImPlotCond_Always);
-            ImPlot::PlotLine(value_label, frame_x.data(), values.data(), n);
-            ImPlot::EndPlot();
-        }
         if (ImPlot::BeginPlot("##hist", ImVec2(-1, -1))) {
             ImPlot::SetupAxes(value_label, "count", 0, 0);
             ImPlot::PlotHistogram(value_label, values.data(), n, bins);
             ImPlot::EndPlot();
         }
     } else {
-        // ImGui core fallback: needs float arrays and a pre-binned histogram.
+        // ImGui core fallback: manually binned histogram.
         const double mn = *std::min_element(values.begin(), values.end());
         const double mx = *std::max_element(values.begin(), values.end());
-        // Auto-follow: plot only the trailing `follow`-sample slice so the newest
-        // values are always shown (ImGui::PlotLines otherwise draws the whole
-        // array squeezed to fit).
-        const int    start   = (n > follow) ? (n - follow) : 0;
-        const int    slice_n = n - start;
-        std::vector<float> vf(values.begin() + start, values.end());
-        ImGui::PlotLines("##line", vf.data(), slice_n, 0, value_label,
-                         static_cast<float>(mn), static_cast<float>(mx),
-                         ImVec2(-1, line_h));
-
         std::vector<float> counts(static_cast<std::size_t>(bins), 0.0f);
         const double range = std::max(mx - mn, 1e-9);
         for (double v : values) {
@@ -155,6 +179,40 @@ void drawMetricWindow(const char* title, bool* open,
         ImGui::PlotHistogram("##hist", counts.data(), bins, 0, value_label,
                              0.0f, FLT_MAX, ImVec2(-1, -1));
     }
+
+    ImGui::End();
+}
+
+// Draw the "Performance" window: two stacked streaming line charts (process
+// CPU % and RSS MB, both vs wall time in seconds) fed by pushPerf(). Reuses
+// drawStreamingLine for the follow-window/autofit behaviour of the metric
+// plots. Render-thread only.
+void drawPerfWindow(bool* open,
+                    const std::vector<double>& t_sec,
+                    const std::vector<double>& cpu_percent,
+                    const std::vector<double>& rss_mb,
+                    int follow_window) {
+    ImGui::SetNextWindowSize(ImVec2(METRIC_PLOT_W, METRIC_PLOT_H),
+                             ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("Performance", open)) {
+        ImGui::End();
+        return;
+    }
+
+    if (t_sec.empty()) {
+        ImGui::TextUnformatted("No samples yet.");
+        ImGui::End();
+        return;
+    }
+
+    // Split the window vertically: CPU chart (top half) + RSS chart (bottom).
+    const ImVec2 avail = ImGui::GetContentRegionAvail();
+    const float  half_h = avail.y * 0.5f;
+
+    drawStreamingLine("##cpu", "t (s)", "% (may exceed 100 with threads)",
+                      t_sec, cpu_percent, follow_window, half_h);
+    drawStreamingLine("##rss", "t (s)", "RSS (MB)",
+                      t_sec, rss_mb, follow_window, -1.0f);
 
     ImGui::End();
 }
@@ -181,12 +239,27 @@ struct DebugViewer::Impl {
     // Groundtruth polyline in ENU.
     std::vector<Eigen::Vector3f> gt_points;
     std::vector<std::string>     gt_coord_names;
+    // Poses of the periodic GT coord-frame gizmos (parallel to gt_coord_names)
+    // so they can be re-uploaded when the "GroundTruth" checkbox is re-enabled.
+    std::vector<Eigen::Affine3f, Eigen::aligned_allocator<Eigen::Affine3f>>
+                                 gt_coord_poses;
 
     // Inferred (external) polyline in ENU, fed via pushRecord()/pushPose().
     std::vector<Eigen::Vector3f> inferred_points;
+    // Per-point roll/pitch/yaw (degrees, parallel to inferred_points) so the
+    // estimate trajectory can be re-rendered as pose-axes gizmos ("EstOdom").
+    std::vector<Eigen::Vector3f> inferred_rpy_deg;
 
     // Discrete LOST-state markers in render units, fed via pushLostPose().
     std::vector<Eigen::Vector3f> lost_points;
+
+    // Latest map-point cloud (drop-oldest snapshot), fed via pushMapPoints().
+    // Producer stores raw display-ENU metres under map_points_mutex_; the render
+    // thread scales it into map_points_render_ (render units) on the dirty flag.
+    std::mutex                   map_points_mutex_;
+    std::vector<Eigen::Vector3f> map_points_latest_;
+    std::atomic<bool>            map_points_dirty_{false};
+    std::vector<Eigen::Vector3f> map_points_render_;
 
     // ENU origin (first valid groundtruth record).
     bool   origin_set = false;
@@ -212,6 +285,13 @@ struct DebugViewer::Impl {
     std::vector<double> frame_x_;
     std::vector<double> inliers_hist_;
     std::vector<double> landmarks_hist_;
+
+    // Performance samples (producer: any thread) drained under queue_mutex like
+    // the metrics, into the render-thread-only histories below (x = t_sec).
+    std::deque<PerfSample> perf_q_;
+    std::vector<double>    perf_t_;
+    std::vector<double>    perf_cpu_;
+    std::vector<double>    perf_rss_;
 
     // Latest video frame: single drop-oldest slot (producer: worker).
     std::mutex        frame_mutex_;
@@ -239,7 +319,23 @@ struct DebugViewer::Impl {
     bool tracking_active_   = false;
     bool show_lost_poses_   = false;
     bool lost_markers_active_ = false;
+    bool map_points_active_ = false;
     bool show_hud_          = false;
+    bool show_perf_         = false;
+    // "GroundTruth" checkbox: gates the rendering of the GT polyline + its
+    // coord-frame gizmos (data keeps accumulating while hidden).
+    bool show_groundtruth_  = true;
+    bool gt_line_active_    = false;
+    bool gt_gizmos_active_  = false;
+    // "EstOdom" checkbox: OFF = orange estimate polyline, ON = per-pose axes.
+    bool show_est_odom_        = false;
+    // "Follow camera" checkbox: gates the periodic auto-recenter lookat().
+    bool follow_camera_        = true;
+    bool inferred_line_active_ = false;
+    // Names of the live estimate pose-axes drawables (for tear-down on toggle)
+    // and the next inferred_points index not yet considered for an axes gizmo.
+    std::vector<std::string> est_axes_names_;
+    std::size_t              est_axes_next_idx_ = 0;
 
     // Latest HUD scalars (render-thread-only; refreshed by drain_aux).
     float hud_heading_     = 0.0f;
@@ -273,6 +369,25 @@ struct DebugViewer::Impl {
         return Eigen::Vector3f(static_cast<float>(x) * s,
                                static_cast<float>(y) * s,
                                static_cast<float>(z) * s * cfg.vertical_scale);
+    }
+
+    // Build a coordinate-frame gizmo transform at render-unit position `pt`
+    // from roll/pitch/yaw in degrees (ZYX: yaw about Up, then pitch, then
+    // roll — the convention of the GT coord frames). `scale_m` is the gizmo
+    // size in metres; display_scale converts it into render units. Shared by
+    // the GT stream gizmos and the "EstOdom" per-pose axes so both use the
+    // exact same orientation convention.
+    Eigen::Affine3f gizmoTransform(const Eigen::Vector3f& pt,
+                                   float roll_deg, float pitch_deg,
+                                   float yaw_deg, float scale_m) const {
+        const float y  = yaw_deg   * static_cast<float>(DEG2RAD);
+        const float p  = pitch_deg * static_cast<float>(DEG2RAD);
+        const float ro = roll_deg  * static_cast<float>(DEG2RAD);
+        return Eigen::Translation3f(pt)
+            * Eigen::AngleAxisf(y,  Eigen::Vector3f::UnitZ())
+            * Eigen::AngleAxisf(p,  Eigen::Vector3f::UnitY())
+            * Eigen::AngleAxisf(ro, Eigen::Vector3f::UnitX())
+            * Eigen::UniformScaling<float>(scale_m * cfg.display_scale);
     }
 
     bool lookupTelemetry(int image_id, TelemetryRecord& out) const {
@@ -359,9 +474,24 @@ void DebugViewer::pushLostPose(const InferredPose& p) {
     impl_->lost_q_.push_back(p);
 }
 
+void DebugViewer::pushMapPoints(const std::vector<Eigen::Vector3f>& pts_enu) {
+    {
+        // Replace the single drop-oldest snapshot so the render thread always
+        // reads a stable, complete cloud (never a partial copy).
+        std::lock_guard<std::mutex> lock(impl_->map_points_mutex_);
+        impl_->map_points_latest_ = pts_enu;
+    }
+    impl_->map_points_dirty_.store(true);
+}
+
 void DebugViewer::pushMetrics(const FrameMetrics& m) {
     std::lock_guard<std::mutex> lock(impl_->queue_mutex);
     impl_->metric_q_.push_back(m);
+}
+
+void DebugViewer::pushPerf(const PerfSample& s) {
+    std::lock_guard<std::mutex> lock(impl_->queue_mutex);
+    impl_->perf_q_.push_back(s);
 }
 
 void DebugViewer::pushFrame(const cv::Mat& image) {
@@ -417,6 +547,10 @@ void DebugViewer::run() {
     impl_->show_tracking_  = impl_->cfg.show_tracking;
     impl_->show_lost_poses_ = impl_->cfg.show_lost_poses;
     impl_->show_hud_       = impl_->cfg.show_hud;
+    impl_->show_perf_      = impl_->cfg.show_perf;
+    impl_->show_groundtruth_ = impl_->cfg.show_groundtruth;
+    impl_->show_est_odom_    = impl_->cfg.est_odom;
+    impl_->follow_camera_    = impl_->cfg.follow_camera;
 
     // --- Decide whether a GL window can be opened. -------------------------
     guik::LightViewer* viewer = nullptr;
@@ -470,6 +604,10 @@ void DebugViewer::run() {
             ImGui::Checkbox("Tracking", &impl_->show_tracking_);
             ImGui::Checkbox("Lost state poses", &impl_->show_lost_poses_);
             ImGui::Checkbox("HUD", &impl_->show_hud_);
+            ImGui::Checkbox("Performance", &impl_->show_perf_);
+            ImGui::Checkbox("GroundTruth", &impl_->show_groundtruth_);
+            ImGui::Checkbox("EstOdom", &impl_->show_est_odom_);
+            ImGui::Checkbox("Follow camera", &impl_->follow_camera_);
             ImGui::End();
 
             // HUD: VO course-over-ground heading, telemetry heading, path length.
@@ -521,25 +659,109 @@ void DebugViewer::run() {
                                  impl_->frame_x_, impl_->landmarks_hist_,
                                  "landmarks", hist_bins, follow_win);
             }
+            if (impl_->show_perf_) {
+                drawPerfWindow(&impl_->show_perf_, impl_->perf_t_,
+                               impl_->perf_cpu_, impl_->perf_rss_, follow_win);
+            }
         });
     }
 
     // --- Helper lambdas that touch GL (only used when viewer != nullptr). --
+    // Upload the GT polyline. No-op while the "GroundTruth" checkbox is off —
+    // the gt_points buffer keeps accumulating regardless (only rendering gated).
     auto refresh_gt_line = [&]() {
-        if (viewer && impl_->gt_points.size() >= 2) {
+        if (viewer && impl_->show_groundtruth_ && impl_->gt_points.size() >= 2) {
             viewer->update_drawable(
                 "gt_trajectory",
                 std::make_shared<glk::ThinLines>(impl_->gt_points, /*line_strip=*/true),
                 guik::FlatColor(GT_COLOR[0], GT_COLOR[1], GT_COLOR[2], GT_COLOR[3]));
+            impl_->gt_line_active_ = true;
         }
     };
-    auto refresh_inferred_line = [&]() {
-        if (viewer && impl_->inferred_points.size() >= 2) {
-            viewer->update_drawable(
-                "inferred_trajectory",
-                std::make_shared<glk::ThinLines>(impl_->inferred_points, /*line_strip=*/true),
-                guik::FlatColor(INFERRED_COLOR[0], INFERRED_COLOR[1],
-                                INFERRED_COLOR[2], INFERRED_COLOR[3]));
+    // Honour the "GroundTruth" checkbox toggle: on disable remove the polyline
+    // AND every GT coord-frame gizmo ("uav_<frame_id>"); on re-enable force a
+    // full re-upload from the accumulated gt buffers (gt_points +
+    // gt_coord_names/gt_coord_poses). Called every drain pass.
+    auto refresh_gt_visibility = [&]() {
+        if (!viewer) return;
+        if (impl_->show_groundtruth_) {
+            if (!impl_->gt_line_active_) {
+                refresh_gt_line();
+            }
+            if (!impl_->gt_gizmos_active_) {
+                for (std::size_t i = 0; i < impl_->gt_coord_names.size(); ++i) {
+                    viewer->update_drawable(impl_->gt_coord_names[i],
+                                            glk::Primitives::coordinate_system(),
+                                            guik::VertexColor(impl_->gt_coord_poses[i]));
+                }
+                impl_->gt_gizmos_active_ = true;
+            }
+        } else {
+            if (impl_->gt_line_active_) {
+                viewer->remove_drawable("gt_trajectory");
+                impl_->gt_line_active_ = false;
+            }
+            if (impl_->gt_gizmos_active_) {
+                for (const std::string& name : impl_->gt_coord_names) {
+                    viewer->remove_drawable(name);
+                }
+                impl_->gt_gizmos_active_ = false;
+            }
+        }
+    };
+    // Estimate-trajectory rendering, gated by the "EstOdom" checkbox: OFF = the
+    // orange polyline (current behaviour); ON = one XYZ pose-axes gizmo per
+    // (est_odom_every_n-th) estimate pose, oriented by the buffered per-pose
+    // roll/pitch/yaw via the same gizmoTransform helper as the GT coord frames.
+    // Toggling swaps the drawables from the SAME accumulated buffer — no data
+    // loss. `new_data` forces a polyline re-upload when fresh points arrived.
+    auto refresh_est_display = [&](bool new_data) {
+        if (!viewer) return;
+        if (impl_->show_est_odom_) {
+            // Axes mode: drop the polyline, then upload gizmos for every pose
+            // not yet considered (covers both the back-fill right after the
+            // toggle, when est_axes_next_idx_ is 0, and fresh points).
+            if (impl_->inferred_line_active_) {
+                viewer->remove_drawable("inferred_trajectory");
+                impl_->inferred_line_active_ = false;
+            }
+            const std::size_t every = static_cast<std::size_t>(
+                std::max(1, impl_->cfg.est_odom_every_n));
+            while (impl_->est_axes_next_idx_ < impl_->inferred_points.size()) {
+                const std::size_t i = impl_->est_axes_next_idx_++;
+                if (i % every != 0) continue;
+                const Eigen::Vector3f& rpy = impl_->inferred_rpy_deg[i];
+                const Eigen::Affine3f T = impl_->gizmoTransform(
+                    impl_->inferred_points[i], rpy.x(), rpy.y(), rpy.z(),
+                    impl_->cfg.est_odom_axes_scale);
+                const std::string name = "est_axes_" + std::to_string(i);
+                viewer->update_drawable(name,
+                                        glk::Primitives::coordinate_system(),
+                                        guik::VertexColor(T));
+                impl_->est_axes_names_.push_back(name);
+            }
+        } else {
+            // Line mode: tear down any axes (toggle-off), then (re-)upload the
+            // orange polyline exactly as before.
+            const bool just_switched = !impl_->est_axes_names_.empty() ||
+                                       impl_->est_axes_next_idx_ != 0;
+            if (just_switched) {
+                for (const std::string& name : impl_->est_axes_names_) {
+                    viewer->remove_drawable(name);
+                }
+                impl_->est_axes_names_.clear();
+                impl_->est_axes_next_idx_ = 0;
+            }
+            if ((new_data || just_switched) &&
+                impl_->inferred_points.size() >= 2) {
+                viewer->update_drawable(
+                    "inferred_trajectory",
+                    std::make_shared<glk::ThinLines>(impl_->inferred_points,
+                                                     /*line_strip=*/true),
+                    guik::FlatColor(INFERRED_COLOR[0], INFERRED_COLOR[1],
+                                    INFERRED_COLOR[2], INFERRED_COLOR[3]));
+                impl_->inferred_line_active_ = true;
+            }
         }
     };
     // Discrete red markers at each LOST-tracking position. `rebuild` forces a
@@ -563,33 +785,68 @@ void DebugViewer::run() {
             impl_->lost_markers_active_ = false;
         }
     };
+    // VO map-point cloud (light blue), gated by the "Landmarks" checkbox. When a
+    // fresh snapshot arrived (dirty), it is scaled into render units and the
+    // drawable is re-uploaded; otherwise this only honours the checkbox toggle
+    // (draw on enable / remove on disable) without re-uploading.
+    auto refresh_map_points = [&]() {
+        if (!viewer) return;
+        bool rebuild = false;
+        if (impl_->map_points_dirty_.load()) {
+            std::lock_guard<std::mutex> lock(impl_->map_points_mutex_);
+            impl_->map_points_render_.clear();
+            impl_->map_points_render_.reserve(impl_->map_points_latest_.size());
+            for (const auto& p : impl_->map_points_latest_) {
+                impl_->map_points_render_.push_back(
+                    impl_->applyScale(p.x(), p.y(), p.z()));
+            }
+            impl_->map_points_dirty_.store(false);
+            rebuild = true;
+        }
+        if (impl_->show_landmarks_ && !impl_->map_points_render_.empty()) {
+            if (rebuild || !impl_->map_points_active_) {
+                viewer->update_drawable(
+                    "map_points",
+                    std::make_shared<glk::PointCloudBuffer>(impl_->map_points_render_),
+                    guik::FlatColor(MAP_POINT_COLOR[0], MAP_POINT_COLOR[1],
+                                    MAP_POINT_COLOR[2], MAP_POINT_COLOR[3])
+                        .set_point_scale(MAP_POINT_SCALE)
+                        .set_point_shape_circle());
+                impl_->map_points_active_ = true;
+            }
+        } else if (impl_->map_points_active_) {
+            viewer->remove_drawable("map_points");
+            impl_->map_points_active_ = false;
+        }
+    };
 
     auto append_gt = [&](const TelemetryRecord& r) {
         DebugViewerCallbacks::on_telemetry(r);
         const Eigen::Vector3f pt = impl_->toEnu(r);
         impl_->gt_points.push_back(pt);
 
-        // Periodic heading coord frame from yaw.
+        // Periodic heading coord frame from yaw. The name + pose are always
+        // buffered (so a hidden trajectory can be fully re-uploaded when the
+        // "GroundTruth" checkbox is re-enabled); the upload itself is gated.
         const int every = impl_->cfg.coord_frame_every_n;
         if (viewer && every > 0 &&
             (static_cast<int>(impl_->gt_points.size()) % every) == 0) {
-            const float y  = static_cast<float>(r.yaw_deg   * DEG2RAD);
-            const float p  = static_cast<float>(r.pitch_deg * DEG2RAD);
-            const float ro = static_cast<float>(r.roll_deg  * DEG2RAD);
-            Eigen::Affine3f T = Eigen::Translation3f(pt)
-                * Eigen::AngleAxisf(y,  Eigen::Vector3f::UnitZ())
-                * Eigen::AngleAxisf(p,  Eigen::Vector3f::UnitY())
-                * Eigen::AngleAxisf(ro, Eigen::Vector3f::UnitX())
-                * Eigen::UniformScaling<float>(impl_->cfg.coord_frame_scale
-                                               * impl_->cfg.display_scale);
+            const Eigen::Affine3f T = impl_->gizmoTransform(
+                pt, static_cast<float>(r.roll_deg),
+                static_cast<float>(r.pitch_deg),
+                static_cast<float>(r.yaw_deg), impl_->cfg.coord_frame_scale);
             const std::string name = "uav_" + std::to_string(r.frame_id);
-            viewer->update_drawable(name, glk::Primitives::coordinate_system(),
-                                    guik::VertexColor(T));
             impl_->gt_coord_names.push_back(name);
+            impl_->gt_coord_poses.push_back(T);
+            if (impl_->show_groundtruth_) {
+                viewer->update_drawable(name,
+                                        glk::Primitives::coordinate_system(),
+                                        guik::VertexColor(T));
+            }
         }
 
         refresh_gt_line();
-        if (viewer && (static_cast<int>(impl_->gt_points.size()) % CAMERA_RECENTER_EVERY_N) == 0) {
+        if (viewer && impl_->follow_camera_ && (static_cast<int>(impl_->gt_points.size()) % CAMERA_RECENTER_EVERY_N) == 0) {
             viewer->lookat(pt);
         }
     };
@@ -610,9 +867,17 @@ void DebugViewer::run() {
         }
         for (const auto& r : local) {
             impl_->inferred_points.push_back(impl_->toEnu(r));
+            impl_->inferred_rpy_deg.emplace_back(
+                static_cast<float>(r.roll_deg),
+                static_cast<float>(r.pitch_deg),
+                static_cast<float>(r.yaw_deg));
         }
         for (const auto& p : est_local) {
             impl_->inferred_points.push_back(impl_->applyScale(p.x, p.y, p.z));
+            impl_->inferred_rpy_deg.emplace_back(
+                static_cast<float>(p.roll_deg),
+                static_cast<float>(p.pitch_deg),
+                static_cast<float>(p.yaw_deg));
         }
         for (const auto& p : gt_local) {
             impl_->gt_points.push_back(impl_->applyScale(p.x, p.y, p.z));
@@ -620,11 +885,19 @@ void DebugViewer::run() {
         for (const auto& p : lost_local) {
             impl_->lost_points.push_back(impl_->applyScale(p.x, p.y, p.z));
         }
-        if (!local.empty() || !est_local.empty()) refresh_inferred_line();
+        // Estimate display: always called so the EstOdom checkbox toggle is
+        // honoured even when no new points arrived this pass.
+        refresh_est_display(!local.empty() || !est_local.empty());
         if (!gt_local.empty())                    refresh_gt_line();
+        // Honour the GroundTruth checkbox toggle (remove on disable / full
+        // re-upload from the accumulated buffers on re-enable).
+        refresh_gt_visibility();
         // Rebuild the marker cloud when new LOST points arrived; otherwise still
         // call to honour the checkbox toggle (draw on enable / remove on disable).
         refresh_lost_markers(!lost_local.empty());
+        // Refresh the VO map-point cloud (honours the "Landmarks" checkbox and
+        // any fresh pushMapPoints() snapshot).
+        refresh_map_points();
     };
 
     // Drain the UI-panel queues (metrics + video) and push them to guik. Runs
@@ -662,6 +935,32 @@ void DebugViewer::run() {
             impl_->hud_heading_     = latest.heading_deg;
             impl_->hud_heading_tel_ = latest.heading_tel_deg;
             impl_->hud_distance_    = latest.distance_m;
+        }
+
+        // 1b) Performance samples: same swap-drain into the render-thread-only
+        //     histories feeding the "Performance" streaming line charts.
+        std::deque<PerfSample> perf_local;
+        {
+            std::lock_guard<std::mutex> lock(impl_->queue_mutex);
+            perf_local.swap(impl_->perf_q_);
+        }
+        if (!perf_local.empty()) {
+            const std::size_t perf_cap = static_cast<std::size_t>(
+                std::max(1, impl_->cfg.perf_plot_history));
+            for (const auto& s : perf_local) {
+                impl_->perf_t_.push_back(s.t_sec);
+                impl_->perf_cpu_.push_back(static_cast<double>(s.cpu_percent));
+                impl_->perf_rss_.push_back(static_cast<double>(s.rss_mb));
+            }
+            auto trim_perf = [perf_cap](std::vector<double>& v) {
+                if (v.size() > perf_cap) {
+                    v.erase(v.begin(),
+                            v.begin() + static_cast<std::ptrdiff_t>(v.size() - perf_cap));
+                }
+            };
+            trim_perf(impl_->perf_t_);
+            trim_perf(impl_->perf_cpu_);
+            trim_perf(impl_->perf_rss_);
         }
 
         // 2) The metric line/histogram windows are drawn directly in the

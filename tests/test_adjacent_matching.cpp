@@ -3,7 +3,7 @@
 // match visualization to disk. Headless-safe (no GUI window).
 #include "uavloc/sensor/video_reader.h"
 #include "uavloc/vo/feature_detector.h"
-#include "uavloc/vo/projection_matcher.h"
+#include "uavloc/vo/tracking.h"
 
 #include <spdlog/spdlog.h>
 #include <opencv2/imgproc.hpp>

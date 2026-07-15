@@ -14,7 +14,7 @@
 #include "uavloc/sensor/camera_model.h"
 #include "uavloc/sensor/geo_reference.h"
 #include "uavloc/sensor/video_reader.h"
-#include "uavloc/vo/vo_data.h"
+#include "uavloc/vo/common.h"
 #include "uavloc/vo/vo_module.h"
 
 #include <Eigen/Core>

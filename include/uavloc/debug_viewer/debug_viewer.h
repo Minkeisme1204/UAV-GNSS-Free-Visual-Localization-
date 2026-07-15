@@ -3,6 +3,7 @@
 #include <uavloc/debug_viewer/telemetry_record.h>
 #include <uavloc/debug_viewer/inferred_pose.h>
 #include <uavloc/debug_viewer/viewer_metrics.h>
+#include <Eigen/Core>
 #include <memory>
 #include <string>
 #include <vector>
@@ -57,6 +58,9 @@ public:
         int         metric_plot_follow_window = 500;
         // Number of bins used by the value-distribution histograms.
         int         histogram_bins      = 30;
+        // Maximum number of process-performance samples (pushPerf) retained by
+        // the "Performance" streaming line charts.
+        int         perf_plot_history   = 2000;
         // Initial visibility of the side panels (toggled live by checkbox). The
         // inliers and landmarks metrics each open their own resizable window with
         // a per-frame line chart and a value-distribution histogram.
@@ -76,6 +80,31 @@ public:
         // heading, the telemetry heading, and the accumulated path length. Fed via
         // pushMetrics(); toggled live by the "HUD" checkbox.
         bool        show_hud            = false;
+        // Show the "Performance" window with two streaming line charts (process
+        // CPU % and RSS MB over wall time). Fed via pushPerf(); toggled live by
+        // the "Performance" checkbox.
+        bool        show_perf           = false;
+        // Show the groundtruth trajectory (green polyline + its periodic
+        // coord-frame gizmos). Toggled live by the "GroundTruth" checkbox.
+        // Groundtruth data keeps accumulating while hidden — only the rendering
+        // is gated; re-enabling re-uploads the full accumulated trajectory.
+        bool        show_groundtruth    = true;
+        // Render the estimate trajectory as per-pose XYZ axes gizmos (one small
+        // red/green/blue coordinate frame per estimate pose, oriented by the
+        // pose roll/pitch/yaw) instead of the orange polyline. Toggled live by
+        // the "EstOdom" checkbox; toggling swaps the drawables from the same
+        // accumulated buffer (no data loss).
+        bool        est_odom            = false;
+        // Draw an axes gizmo for 1 of every N estimate poses (>= 1) in EstOdom
+        // mode.
+        int         est_odom_every_n    = 1;
+        // Size of the estimate pose-axes gizmos (metres; same display scaling
+        // as the groundtruth coord-frame gizmos).
+        float       est_odom_axes_scale = 10.0f;
+        // Periodically re-center the 3D camera on the latest groundtruth point
+        // (auto lookat every N points). Disable to pan/orbit freely with the
+        // mouse. Toggled live by the "Follow camera" checkbox.
+        bool        follow_camera       = true;
     };
 
     DebugViewer();
@@ -98,9 +127,18 @@ public:
     // position from any thread; rendered as a discrete red marker when the "Lost
     // state poses" checkbox is enabled. Thread-safe.
     void pushLostPose(const InferredPose& p);
+    // Replace the map-point cloud (already in display ENU, metres) from any
+    // thread; rendered as a 3D point cloud when the "Landmarks" checkbox is
+    // enabled. Each call supersedes the previous cloud (drop-oldest snapshot).
+    // Thread-safe.
+    void pushMapPoints(const std::vector<Eigen::Vector3f>& pts_enu);
     // Push a per-frame metric sample (inliers + landmark count) from any thread;
     // drained into the live line chart by the render loop. Thread-safe.
     void pushMetrics(const FrameMetrics& m);
+    // Push a process-performance sample (CPU % + RSS MB at t_sec) from any
+    // thread; drained into the "Performance" streaming line charts by the
+    // render loop (ring buffer capped at Config::perf_plot_history). Thread-safe.
+    void pushPerf(const PerfSample& s);
     // Push the latest video frame from any thread; cloned into a single
     // drop-oldest slot and uploaded as a texture by the render loop. Thread-safe.
     void pushFrame(const cv::Mat& image);
