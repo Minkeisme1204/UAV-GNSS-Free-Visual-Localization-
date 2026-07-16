@@ -44,4 +44,13 @@ struct FusionResult {
     bool graph_updated = false;
 };
 
+//! One keyframe pose still alive inside the fixed-lag smoother window, as
+//! re-optimized by the latest smoother update. FusionModule::getLagWindow()
+//! returns these in ascending frame_id so a viewer can redraw the recent past
+//! of the fused trajectory with the corrected (smoothed) poses.
+struct FusionLagPose {
+    unsigned int frame_id = 0;
+    Eigen::Isometry3d T_enu_c = Eigen::Isometry3d::Identity();
+};
+
 } // namespace uavloc::fusion

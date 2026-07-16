@@ -64,9 +64,10 @@ const char* const VIDEO_PANEL_NAME = "VO video";
 // GL resource name for the checkbox-toggled tracking-overlay side panel.
 const char* const TRACKING_PANEL_NAME = "VO tracking";
 
-// Colours (RGBA) for the two trajectories.
+// Colours (RGBA) for the three trajectories.
 constexpr float GT_COLOR[4]       = {0.2f, 0.9f, 0.4f, 1.0f};  // green
 constexpr float INFERRED_COLOR[4] = {0.95f, 0.55f, 0.1f, 1.0f}; // orange
+constexpr float FUSED_COLOR[4]    = {0.90f, 0.20f, 0.90f, 1.0f}; // magenta
 
 // Colour + screen-space point size for the discrete LOST-state markers.
 constexpr float LOST_COLOR[4]           = {0.95f, 0.15f, 0.15f, 1.0f}; // red
@@ -238,6 +239,10 @@ struct DebugViewer::Impl {
 
     // Groundtruth polyline in ENU.
     std::vector<Eigen::Vector3f> gt_points;
+    // Per-point roll/pitch/yaw (degrees, parallel to gt_points) so the GT
+    // trajectory can be re-rendered as monochrome green pose-axes gizmos in
+    // "EstOdom" mode (same convention as the uav_* coord frames).
+    std::vector<Eigen::Vector3f> gt_rpy_deg;
     std::vector<std::string>     gt_coord_names;
     // Poses of the periodic GT coord-frame gizmos (parallel to gt_coord_names)
     // so they can be re-uploaded when the "GroundTruth" checkbox is re-enabled.
@@ -252,6 +257,18 @@ struct DebugViewer::Impl {
 
     // Discrete LOST-state markers in render units, fed via pushLostPose().
     std::vector<Eigen::Vector3f> lost_points;
+
+    // Fused (VO+telemetry back-end) trajectory in render units, fed via
+    // pushFusedPose(): positions plus parallel ENU orientation quaternions and
+    // parallel source frame ids (splice key for pushFusedCorrection). The
+    // magenta polyline uses positions only; the "EstOdom" RGB pose-axes use
+    // positions + quaternions. Accumulates regardless of the "Fused" checkbox
+    // (only rendering is gated), same as the estimate line. Frame ids arrive
+    // monotonically non-decreasing (per-frame VO stream).
+    std::vector<Eigen::Vector3f> fused_points;
+    std::vector<Eigen::Quaternionf,
+                Eigen::aligned_allocator<Eigen::Quaternionf>> fused_quats;
+    std::vector<uint64_t>        fused_frame_ids;
 
     // Latest map-point cloud (drop-oldest snapshot), fed via pushMapPoints().
     // Producer stores raw display-ENU metres under map_points_mutex_; the render
@@ -269,10 +286,31 @@ struct DebugViewer::Impl {
     std::mutex                 queue_mutex;
     std::deque<TelemetryRecord> inferred_queue;
 
+    // A fused pose sample as pushed: display-ENU position + ENU orientation +
+    // the source frame id (splice key for corrections).
+    struct FusedSample {
+        Eigen::Vector3f    pos;
+        Eigen::Quaternionf q;
+        uint64_t           frame_id = 0;
+    };
+
+    // A fused-channel event, drained by the render loop in push order (a
+    // single queue keeps live samples and corrections strictly ordered):
+    // either one live sample (is_correction == false, `correction` empty) or
+    // a smoother-correction batch (is_correction == true) that replaces every
+    // stored sample with frame_id >= correction.front().frame_id.
+    struct FusedEvent {
+        bool                         is_correction = false;
+        FusedSample                  sample;
+        std::vector<FusedCorrection> correction;
+    };
+
     // Thread-safe metric pose queues (already in display ENU; no GPS round-trip).
     std::deque<InferredPose>   est_q_;   // estimate -> inferred polyline (orange)
     std::deque<InferredPose>   gt_q_;    // groundtruth -> gt polyline (green)
     std::deque<InferredPose>   lost_q_;  // LOST positions -> red markers
+    std::deque<FusedEvent,
+               Eigen::aligned_allocator<FusedEvent>> fused_q_; // fused events
 
     std::atomic<bool> stop_flag{false};
     std::atomic<bool> had_display{false};
@@ -327,15 +365,25 @@ struct DebugViewer::Impl {
     bool show_groundtruth_  = true;
     bool gt_line_active_    = false;
     bool gt_gizmos_active_  = false;
-    // "EstOdom" checkbox: OFF = orange estimate polyline, ON = per-pose axes.
+    // "Fused" checkbox: gates the rendering of the fused polyline (data keeps
+    // accumulating while hidden — same semantics as GroundTruth).
+    bool show_fused_        = true;
+    bool fused_line_active_ = false;
+    // "EstOdom" checkbox: OFF = line rendering for all three trajectories,
+    // ON = per-pose axes chains (GT green, estimate orange, fused RGB).
     bool show_est_odom_        = false;
     // "Follow camera" checkbox: gates the periodic auto-recenter lookat().
     bool follow_camera_        = true;
     bool inferred_line_active_ = false;
-    // Names of the live estimate pose-axes drawables (for tear-down on toggle)
-    // and the next inferred_points index not yet considered for an axes gizmo.
+    // Names of the live pose-axes drawables per trajectory (for tear-down on
+    // toggle) and the next buffer index not yet considered for an axes gizmo.
+    // Same swap mechanism for all three: estimate / groundtruth / fused.
     std::vector<std::string> est_axes_names_;
     std::size_t              est_axes_next_idx_ = 0;
+    std::vector<std::string> gt_axes_names_;
+    std::size_t              gt_axes_next_idx_ = 0;
+    std::vector<std::string> fused_axes_names_;
+    std::size_t              fused_axes_next_idx_ = 0;
 
     // Latest HUD scalars (render-thread-only; refreshed by drain_aux).
     float hud_heading_     = 0.0f;
@@ -387,6 +435,17 @@ struct DebugViewer::Impl {
             * Eigen::AngleAxisf(y,  Eigen::Vector3f::UnitZ())
             * Eigen::AngleAxisf(p,  Eigen::Vector3f::UnitY())
             * Eigen::AngleAxisf(ro, Eigen::Vector3f::UnitX())
+            * Eigen::UniformScaling<float>(scale_m * cfg.display_scale);
+    }
+
+    // Pose-axes gizmo transform from an orientation quaternion (already in
+    // the display/ENU frame) instead of roll/pitch/yaw — used by the fused
+    // trajectory whose orientation arrives as a quaternion. Same scaling
+    // treatment as gizmoTransform.
+    Eigen::Affine3f gizmoTransformQuat(const Eigen::Vector3f& pt,
+                                       const Eigen::Quaternionf& q,
+                                       float scale_m) const {
+        return Eigen::Translation3f(pt) * q.normalized()
             * Eigen::UniformScaling<float>(scale_m * cfg.display_scale);
     }
 
@@ -474,6 +533,24 @@ void DebugViewer::pushLostPose(const InferredPose& p) {
     impl_->lost_q_.push_back(p);
 }
 
+void DebugViewer::pushFusedPose(const Eigen::Vector3f& enu_pos,
+                                const Eigen::Quaternionf& q_enu,
+                                uint64_t frame_id) {
+    std::lock_guard<std::mutex> lock(impl_->queue_mutex);
+    Impl::FusedEvent ev;
+    ev.sample = {enu_pos, q_enu, frame_id};
+    impl_->fused_q_.push_back(std::move(ev));
+}
+
+void DebugViewer::pushFusedCorrection(const std::vector<FusedCorrection>& corrected) {
+    if (corrected.empty()) return;
+    std::lock_guard<std::mutex> lock(impl_->queue_mutex);
+    Impl::FusedEvent ev;
+    ev.is_correction = true;
+    ev.correction    = corrected;
+    impl_->fused_q_.push_back(std::move(ev));
+}
+
 void DebugViewer::pushMapPoints(const std::vector<Eigen::Vector3f>& pts_enu) {
     {
         // Replace the single drop-oldest snapshot so the render thread always
@@ -551,6 +628,7 @@ void DebugViewer::run() {
     impl_->show_groundtruth_ = impl_->cfg.show_groundtruth;
     impl_->show_est_odom_    = impl_->cfg.est_odom;
     impl_->follow_camera_    = impl_->cfg.follow_camera;
+    impl_->show_fused_       = impl_->cfg.show_fused;
 
     // --- Decide whether a GL window can be opened. -------------------------
     guik::LightViewer* viewer = nullptr;
@@ -608,6 +686,7 @@ void DebugViewer::run() {
             ImGui::Checkbox("GroundTruth", &impl_->show_groundtruth_);
             ImGui::Checkbox("EstOdom", &impl_->show_est_odom_);
             ImGui::Checkbox("Follow camera", &impl_->follow_camera_);
+            ImGui::Checkbox("Fused", &impl_->show_fused_);
             ImGui::End();
 
             // HUD: VO course-over-ground heading, telemetry heading, path length.
@@ -667,10 +746,12 @@ void DebugViewer::run() {
     }
 
     // --- Helper lambdas that touch GL (only used when viewer != nullptr). --
-    // Upload the GT polyline. No-op while the "GroundTruth" checkbox is off —
-    // the gt_points buffer keeps accumulating regardless (only rendering gated).
+    // Upload the GT polyline. No-op while the "GroundTruth" checkbox is off or
+    // EstOdom (axes style) is on — the gt_points buffer keeps accumulating
+    // regardless (only rendering gated).
     auto refresh_gt_line = [&]() {
-        if (viewer && impl_->show_groundtruth_ && impl_->gt_points.size() >= 2) {
+        if (viewer && impl_->show_groundtruth_ && !impl_->show_est_odom_ &&
+            impl_->gt_points.size() >= 2) {
             viewer->update_drawable(
                 "gt_trajectory",
                 std::make_shared<glk::ThinLines>(impl_->gt_points, /*line_strip=*/true),
@@ -678,25 +759,21 @@ void DebugViewer::run() {
             impl_->gt_line_active_ = true;
         }
     };
-    // Honour the "GroundTruth" checkbox toggle: on disable remove the polyline
-    // AND every GT coord-frame gizmo ("uav_<frame_id>"); on re-enable force a
-    // full re-upload from the accumulated gt buffers (gt_points +
-    // gt_coord_names/gt_coord_poses). Called every drain pass.
-    auto refresh_gt_visibility = [&]() {
+    // GT rendering, gated by the "GroundTruth" checkbox (master) and styled by
+    // "EstOdom": line mode = green polyline + periodic uav_* coord-frame gizmos
+    // (coord_frame_every_n cadence); EstOdom mode = monochrome GREEN pose-axes
+    // chain at est_odom_every_n cadence over the accumulated GT records (same
+    // gizmoTransform orientation convention as the uav_* frames). Toggling
+    // either checkbox swaps the drawables from the accumulated buffers
+    // (gt_points/gt_rpy_deg + gt_coord_names/gt_coord_poses) — no data loss.
+    // Called every drain pass.
+    auto refresh_gt_display = [&]() {
         if (!viewer) return;
-        if (impl_->show_groundtruth_) {
-            if (!impl_->gt_line_active_) {
-                refresh_gt_line();
-            }
-            if (!impl_->gt_gizmos_active_) {
-                for (std::size_t i = 0; i < impl_->gt_coord_names.size(); ++i) {
-                    viewer->update_drawable(impl_->gt_coord_names[i],
-                                            glk::Primitives::coordinate_system(),
-                                            guik::VertexColor(impl_->gt_coord_poses[i]));
-                }
-                impl_->gt_gizmos_active_ = true;
-            }
-        } else {
+        const bool line_mode = impl_->show_groundtruth_ && !impl_->show_est_odom_;
+        const bool axes_mode = impl_->show_groundtruth_ && impl_->show_est_odom_;
+        // Tear down whichever style is no longer active (stale drawables must
+        // not linger across a mode/visibility switch).
+        if (!line_mode) {
             if (impl_->gt_line_active_) {
                 viewer->remove_drawable("gt_trajectory");
                 impl_->gt_line_active_ = false;
@@ -708,13 +785,55 @@ void DebugViewer::run() {
                 impl_->gt_gizmos_active_ = false;
             }
         }
+        if (!axes_mode &&
+            (!impl_->gt_axes_names_.empty() || impl_->gt_axes_next_idx_ != 0)) {
+            for (const std::string& name : impl_->gt_axes_names_) {
+                viewer->remove_drawable(name);
+            }
+            impl_->gt_axes_names_.clear();
+            impl_->gt_axes_next_idx_ = 0;
+        }
+        if (line_mode) {
+            if (!impl_->gt_line_active_) {
+                refresh_gt_line();
+            }
+            if (!impl_->gt_gizmos_active_) {
+                for (std::size_t i = 0; i < impl_->gt_coord_names.size(); ++i) {
+                    viewer->update_drawable(impl_->gt_coord_names[i],
+                                            glk::Primitives::coordinate_system(),
+                                            guik::VertexColor(impl_->gt_coord_poses[i]));
+                }
+                impl_->gt_gizmos_active_ = true;
+            }
+        } else if (axes_mode) {
+            // Upload a green axes gizmo for every GT pose not yet considered
+            // (covers both the back-fill right after the toggle, when
+            // gt_axes_next_idx_ is 0, and fresh points).
+            const std::size_t every = static_cast<std::size_t>(
+                std::max(1, impl_->cfg.est_odom_every_n));
+            while (impl_->gt_axes_next_idx_ < impl_->gt_points.size()) {
+                const std::size_t i = impl_->gt_axes_next_idx_++;
+                if (i % every != 0) continue;
+                const Eigen::Vector3f& rpy = impl_->gt_rpy_deg[i];
+                const Eigen::Affine3f T = impl_->gizmoTransform(
+                    impl_->gt_points[i], rpy.x(), rpy.y(), rpy.z(),
+                    impl_->cfg.est_odom_axes_scale);
+                const std::string name = "gt_axes_" + std::to_string(i);
+                viewer->update_drawable(
+                    name, glk::Primitives::coordinate_system(),
+                    guik::FlatColor(GT_COLOR[0], GT_COLOR[1], GT_COLOR[2],
+                                    GT_COLOR[3], T));
+                impl_->gt_axes_names_.push_back(name);
+            }
+        }
     };
-    // Estimate-trajectory rendering, gated by the "EstOdom" checkbox: OFF = the
-    // orange polyline (current behaviour); ON = one XYZ pose-axes gizmo per
-    // (est_odom_every_n-th) estimate pose, oriented by the buffered per-pose
-    // roll/pitch/yaw via the same gizmoTransform helper as the GT coord frames.
-    // Toggling swaps the drawables from the SAME accumulated buffer — no data
-    // loss. `new_data` forces a polyline re-upload when fresh points arrived.
+    // Estimate-trajectory rendering, styled by the "EstOdom" checkbox: OFF =
+    // the orange polyline (line mode); ON = one monochrome ORANGE pose-axes
+    // gizmo per (est_odom_every_n-th) estimate pose, oriented by the buffered
+    // per-pose roll/pitch/yaw via the same gizmoTransform helper as the GT
+    // coord frames (RGB axes belong to the fused trajectory). Toggling swaps
+    // the drawables from the SAME accumulated buffer — no data loss.
+    // `new_data` forces a polyline re-upload when fresh points arrived.
     auto refresh_est_display = [&](bool new_data) {
         if (!viewer) return;
         if (impl_->show_est_odom_) {
@@ -735,9 +854,10 @@ void DebugViewer::run() {
                     impl_->inferred_points[i], rpy.x(), rpy.y(), rpy.z(),
                     impl_->cfg.est_odom_axes_scale);
                 const std::string name = "est_axes_" + std::to_string(i);
-                viewer->update_drawable(name,
-                                        glk::Primitives::coordinate_system(),
-                                        guik::VertexColor(T));
+                viewer->update_drawable(
+                    name, glk::Primitives::coordinate_system(),
+                    guik::FlatColor(INFERRED_COLOR[0], INFERRED_COLOR[1],
+                                    INFERRED_COLOR[2], INFERRED_COLOR[3], T));
                 impl_->est_axes_names_.push_back(name);
             }
         } else {
@@ -761,6 +881,60 @@ void DebugViewer::run() {
                     guik::FlatColor(INFERRED_COLOR[0], INFERRED_COLOR[1],
                                     INFERRED_COLOR[2], INFERRED_COLOR[3]));
                 impl_->inferred_line_active_ = true;
+            }
+        }
+    };
+    // Fused-trajectory rendering, gated by the "Fused" checkbox (master) with
+    // the same semantics as the GroundTruth line — fused buffers keep
+    // accumulating while hidden — and styled by "EstOdom": line mode = magenta
+    // polyline (positions only); EstOdom mode = standard-RGB pose-axes chain
+    // (X red, Y green, Z blue) at est_odom_every_n cadence, oriented by the
+    // buffered per-pose ENU quaternion. Toggling either checkbox swaps the
+    // drawables from the accumulated buffers (no data loss). `new_data` forces
+    // a polyline re-upload when fresh points arrived this drain pass.
+    auto refresh_fused_display = [&](bool new_data) {
+        if (!viewer) return;
+        const bool line_mode = impl_->show_fused_ && !impl_->show_est_odom_;
+        const bool axes_mode = impl_->show_fused_ && impl_->show_est_odom_;
+        // Tear down whichever style is no longer active.
+        if (!line_mode && impl_->fused_line_active_) {
+            viewer->remove_drawable("fused_trajectory");
+            impl_->fused_line_active_ = false;
+        }
+        if (!axes_mode &&
+            (!impl_->fused_axes_names_.empty() || impl_->fused_axes_next_idx_ != 0)) {
+            for (const std::string& name : impl_->fused_axes_names_) {
+                viewer->remove_drawable(name);
+            }
+            impl_->fused_axes_names_.clear();
+            impl_->fused_axes_next_idx_ = 0;
+        }
+        if (line_mode && impl_->fused_points.size() >= 2) {
+            if (new_data || !impl_->fused_line_active_) {
+                viewer->update_drawable(
+                    "fused_trajectory",
+                    std::make_shared<glk::ThinLines>(impl_->fused_points,
+                                                     /*line_strip=*/true),
+                    guik::FlatColor(FUSED_COLOR[0], FUSED_COLOR[1],
+                                    FUSED_COLOR[2], FUSED_COLOR[3]));
+                impl_->fused_line_active_ = true;
+            }
+        } else if (axes_mode) {
+            // Upload an RGB axes gizmo for every fused pose not yet considered
+            // (back-fill after the toggle + fresh points).
+            const std::size_t every = static_cast<std::size_t>(
+                std::max(1, impl_->cfg.est_odom_every_n));
+            while (impl_->fused_axes_next_idx_ < impl_->fused_points.size()) {
+                const std::size_t i = impl_->fused_axes_next_idx_++;
+                if (i % every != 0) continue;
+                const Eigen::Affine3f T = impl_->gizmoTransformQuat(
+                    impl_->fused_points[i], impl_->fused_quats[i],
+                    impl_->cfg.est_odom_axes_scale);
+                const std::string name = "fused_axes_" + std::to_string(i);
+                viewer->update_drawable(name,
+                                        glk::Primitives::coordinate_system(),
+                                        guik::VertexColor(T));
+                impl_->fused_axes_names_.push_back(name);
             }
         }
     };
@@ -824,10 +998,15 @@ void DebugViewer::run() {
         DebugViewerCallbacks::on_telemetry(r);
         const Eigen::Vector3f pt = impl_->toEnu(r);
         impl_->gt_points.push_back(pt);
+        impl_->gt_rpy_deg.emplace_back(static_cast<float>(r.roll_deg),
+                                       static_cast<float>(r.pitch_deg),
+                                       static_cast<float>(r.yaw_deg));
 
         // Periodic heading coord frame from yaw. The name + pose are always
         // buffered (so a hidden trajectory can be fully re-uploaded when the
-        // "GroundTruth" checkbox is re-enabled); the upload itself is gated.
+        // "GroundTruth" checkbox is re-enabled); the upload itself is gated on
+        // both the checkbox AND line mode (EstOdom replaces the uav_* gizmos
+        // with the green pose-axes chain).
         const int every = impl_->cfg.coord_frame_every_n;
         if (viewer && every > 0 &&
             (static_cast<int>(impl_->gt_points.size()) % every) == 0) {
@@ -838,7 +1017,7 @@ void DebugViewer::run() {
             const std::string name = "uav_" + std::to_string(r.frame_id);
             impl_->gt_coord_names.push_back(name);
             impl_->gt_coord_poses.push_back(T);
-            if (impl_->show_groundtruth_) {
+            if (impl_->show_groundtruth_ && !impl_->show_est_odom_) {
                 viewer->update_drawable(name,
                                         glk::Primitives::coordinate_system(),
                                         guik::VertexColor(T));
@@ -858,12 +1037,15 @@ void DebugViewer::run() {
         std::deque<InferredPose>    est_local;
         std::deque<InferredPose>    gt_local;
         std::deque<InferredPose>    lost_local;
+        std::deque<Impl::FusedEvent,
+                   Eigen::aligned_allocator<Impl::FusedEvent>> fused_local;
         {
             std::lock_guard<std::mutex> lock(impl_->queue_mutex);
             local.swap(impl_->inferred_queue);
             est_local.swap(impl_->est_q_);
             gt_local.swap(impl_->gt_q_);
             lost_local.swap(impl_->lost_q_);
+            fused_local.swap(impl_->fused_q_);
         }
         for (const auto& r : local) {
             impl_->inferred_points.push_back(impl_->toEnu(r));
@@ -881,17 +1063,74 @@ void DebugViewer::run() {
         }
         for (const auto& p : gt_local) {
             impl_->gt_points.push_back(impl_->applyScale(p.x, p.y, p.z));
+            impl_->gt_rpy_deg.emplace_back(static_cast<float>(p.roll_deg),
+                                           static_cast<float>(p.pitch_deg),
+                                           static_cast<float>(p.yaw_deg));
         }
         for (const auto& p : lost_local) {
             impl_->lost_points.push_back(impl_->applyScale(p.x, p.y, p.z));
+        }
+        bool fused_new_data  = false;
+        bool fused_corrected = false;
+        for (const auto& ev : fused_local) {
+            if (!ev.is_correction) {
+                const Impl::FusedSample& s = ev.sample;
+                impl_->fused_points.push_back(
+                    impl_->applyScale(s.pos.x(), s.pos.y(), s.pos.z()));
+                impl_->fused_quats.push_back(s.q);
+                impl_->fused_frame_ids.push_back(s.frame_id);
+                fused_new_data = true;
+                continue;
+            }
+            // Correction batch: splice out every stored sample with
+            // frame_id >= the first corrected frame_id (frame ids are
+            // monotonic, so a back-scan finds the exact cut), then append the
+            // corrected (smoothed) chain in order. Live samples pushed after
+            // the correction re-append behind it as usual.
+            const uint64_t cut = ev.correction.front().frame_id;
+            std::size_t keep = impl_->fused_frame_ids.size();
+            while (keep > 0 && impl_->fused_frame_ids[keep - 1] >= cut) {
+                --keep;
+            }
+            impl_->fused_points.resize(keep);
+            impl_->fused_quats.resize(keep);
+            impl_->fused_frame_ids.resize(keep);
+            for (const auto& c : ev.correction) {
+                impl_->fused_points.push_back(
+                    impl_->applyScale(c.pos.x(), c.pos.y(), c.pos.z()));
+                impl_->fused_quats.push_back(c.q);
+                impl_->fused_frame_ids.push_back(c.frame_id);
+            }
+            fused_new_data  = true;
+            fused_corrected = true;
+        }
+        // A correction invalidates the incremental fused drawables: tear down
+        // the polyline and every uploaded axes gizmo and reset the append
+        // cursor so refresh_fused_display re-uploads the FULL spliced buffer
+        // (whichever style the current EstOdom mode selects).
+        if (fused_corrected && viewer) {
+            if (impl_->fused_line_active_) {
+                viewer->remove_drawable("fused_trajectory");
+                impl_->fused_line_active_ = false;
+            }
+            for (const std::string& name : impl_->fused_axes_names_) {
+                viewer->remove_drawable(name);
+            }
+            impl_->fused_axes_names_.clear();
+            impl_->fused_axes_next_idx_ = 0;
         }
         // Estimate display: always called so the EstOdom checkbox toggle is
         // honoured even when no new points arrived this pass.
         refresh_est_display(!local.empty() || !est_local.empty());
         if (!gt_local.empty())                    refresh_gt_line();
-        // Honour the GroundTruth checkbox toggle (remove on disable / full
-        // re-upload from the accumulated buffers on re-enable).
-        refresh_gt_visibility();
+        // Fused display: rebuild on new points; otherwise still called so the
+        // "Fused"/"EstOdom" checkbox toggles are honoured (remove on disable /
+        // style swap / full re-upload from the accumulated buffers on re-enable).
+        refresh_fused_display(fused_new_data);
+        // Honour the GroundTruth + EstOdom checkbox toggles (remove on disable /
+        // style swap / full re-upload from the accumulated buffers on re-enable);
+        // in EstOdom mode this also uploads green axes for fresh GT points.
+        refresh_gt_display();
         // Rebuild the marker cloud when new LOST points arrived; otherwise still
         // call to honour the checkbox toggle (draw on enable / remove on disable).
         refresh_lost_markers(!lost_local.empty());

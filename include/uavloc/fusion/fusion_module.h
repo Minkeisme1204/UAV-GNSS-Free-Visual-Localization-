@@ -31,6 +31,7 @@
 
 #include <functional>
 #include <memory>
+#include <vector>
 
 namespace uavloc::fusion {
 
@@ -62,6 +63,12 @@ public:
 
     //! Thread-safe snapshot of the newest result.
     FusionResult latest() const;
+
+    //! Thread-safe copy of the corrected lag window: every keyframe pose still
+    //! alive in the fixed-lag smoother, re-optimized by the latest update, in
+    //! ascending frame_id. Rebuilt after every keyframe smoother update —
+    //! snapshot only, never touches the graph.
+    std::vector<FusionLagPose> getLagWindow() const;
 
 private:
     struct Impl;

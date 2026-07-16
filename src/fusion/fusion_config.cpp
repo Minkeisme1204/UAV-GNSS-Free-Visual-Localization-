@@ -25,6 +25,8 @@ FusionConfig FusionConfig::fromYaml(const YAML::Node& root) {
     cfg.theta_init_deg      = node["theta_init_deg"].as<double>(cfg.theta_init_deg);
     cfg.theta_sigma_deg     = node["theta_sigma_deg"].as<double>(cfg.theta_sigma_deg);
     cfg.anchor_xy_sigma_m   = node["anchor_xy_sigma_m"].as<double>(cfg.anchor_xy_sigma_m);
+    cfg.reinit_trans_inflation =
+        node["reinit_trans_inflation"].as<double>(cfg.reinit_trans_inflation);
 
     cfg.huber_k = node["huber_k"].as<double>(cfg.huber_k);
 

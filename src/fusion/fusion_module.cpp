@@ -133,6 +133,11 @@ struct FusionModule::Impl {
         return latest_;
     }
 
+    std::vector<FusionLagPose> getLagWindow() const {
+        std::lock_guard<std::mutex> lock(mtx_latest_);
+        return lag_window_;
+    }
+
 private:
     //! Fusion-thread loop: consume the work queue. On terminate, drain the
     //! remaining items before exiting (bounded: just finish the queue).
@@ -166,6 +171,15 @@ private:
         FusionResult out;
         out.frame_id       = item.res.frame_id;
         out.timestamp_msec = item.res.timestamp_msec;
+
+        // Re-init boundary tracking: any non-TRACKING result (LOST or
+        // NOT_INITIALIZED) seen since the previous keyframe marks the next
+        // keyframe as a post-reinit boundary. VOModule welds pose continuity
+        // across the gap and re-seeds its metric scale from altitude, so the
+        // cross-boundary factors must be handled specially (see addKeyframe).
+        if (item.res.state != vo::VOTrackingState::TRACKING) {
+            saw_non_tracking_since_kf_ = true;
+        }
 
         // LOST / re-init frames: skip the graph, still emit an invalid result.
         if (!item.res.has_pose) {
@@ -319,7 +333,12 @@ private:
         keyframe_count_      = 1;
         last_kf_psi_rad_     = psiRad(item.telem);
         last_kf_telem_valid_ = true;  // initialize() requires valid telemetry
+        saw_non_tracking_since_kf_ = false;
         initialized_         = true;
+
+        kf_registry_.clear();
+        kf_registry_.push_back({0, item.res.frame_id});
+        rebuildLagWindow();
 
         spdlog::info("FusionModule: initialized — X(0) anchored at frame {} "
                      "(t={:.3f}s, agl={:.1f} m, heading={:.1f}°)",
@@ -335,38 +354,61 @@ private:
     //!   4. rotation-only attitude prior (roll/pitch tight, yaw loose —
     //!      absolute heading enters ONLY via the delta factor, θ unknown);
     //!   5. AglFactor(x(k), b(k)) — gated on validity + altitude > 0.
+    //!
+    //! Post-reinit boundary keyframes (a non-TRACKING VO result was seen since
+    //! the previous keyframe) deviate from the table: the ScaledVOFactor
+    //! translation sigma is inflated (the welded pose across the LOST gap is
+    //! an assumption, not a measurement), the s(k-1)→s(k) walk is replaced by
+    //! a fresh s(k)=1 prior (VO re-seeded metric scale from altitude), and the
+    //! delta-yaw factor is skipped (heading during the blind gap is unknown
+    //! motion — the wrapped Δψ could alias). The b(k) bias chain is kept: the
+    //! AGL-vs-ENU-Z bias is a telemetry property, unaffected by VO re-init.
     void addKeyframe(const WorkItem& item, const Eigen::Isometry3d& T_wc) {
         const unsigned int k     = next_key_;
         const double       t_sec = item.res.timestamp_msec * MSEC_TO_SEC;
+        const bool reinit_boundary = saw_non_tracking_since_kf_;
 
         const Eigen::Isometry3d T_rel = T_wc_last_kf_.inverse() * T_wc;
         const gtsam::Pose3      rel(T_rel.matrix());
 
         gtsam::NonlinearFactorGraph graph;
 
-        // 1. Scaled VO relative-pose factor (Huber-robust).
+        // 1. Scaled VO relative-pose factor (Huber-robust). At a boundary the
+        //    translation sigma is inflated (rotation sigma unchanged).
         {
             gtsam::Vector6 sigmas;
-            const double rot_sigma = config_.vo_rot_sigma_deg * DEG_TO_RAD;
+            const double rot_sigma   = config_.vo_rot_sigma_deg * DEG_TO_RAD;
+            const double trans_sigma = config_.vo_trans_sigma_m *
+                (reinit_boundary ? config_.reinit_trans_inflation : 1.0);
             sigmas << rot_sigma, rot_sigma, rot_sigma,
-                      config_.vo_trans_sigma_m, config_.vo_trans_sigma_m,
-                      config_.vo_trans_sigma_m;
+                      trans_sigma, trans_sigma, trans_sigma;
             const auto vo_noise = gtsam::noiseModel::Robust::Create(
                 gtsam::noiseModel::mEstimator::Huber::Create(config_.huber_k),
                 gtsam::noiseModel::Diagonal::Sigmas(sigmas));
             graph.emplace_shared<ScaledVOFactor>(X(k - 1), X(k), S(k), rel, vo_noise);
         }
 
-        // 2. Random-walk chains on scale and AGL bias.
-        graph.emplace_shared<gtsam::BetweenFactor<double>>(
-            S(k - 1), S(k), 0.0,
-            gtsam::noiseModel::Isotropic::Sigma(1, config_.scale_walk_sigma));
+        // 2. Scale: random walk within a VO segment; at a boundary the VO
+        //    scale may jump discontinuously, so restart with a fresh s(k)=1
+        //    prior instead of chaining across the weld.
+        if (reinit_boundary) {
+            graph.emplace_shared<gtsam::PriorFactor<double>>(
+                S(k), 1.0,
+                gtsam::noiseModel::Isotropic::Sigma(1, config_.scale_prior_sigma));
+        } else {
+            graph.emplace_shared<gtsam::BetweenFactor<double>>(
+                S(k - 1), S(k), 0.0,
+                gtsam::noiseModel::Isotropic::Sigma(1, config_.scale_walk_sigma));
+        }
+        //    AGL-bias walk: kept across boundaries (telemetry property).
         graph.emplace_shared<gtsam::BetweenFactor<double>>(
             B(k - 1), B(k), 0.0,
             gtsam::noiseModel::Isotropic::Sigma(1, config_.agl_bias_walk_m));
 
-        // 3. Delta-yaw factor (offset-immune heading constraint).
-        if (item.telem.valid && last_kf_telem_valid_) {
+        // 3. Delta-yaw factor (offset-immune heading constraint). Skipped at
+        //    a boundary: the heading step spans the blind LOST gap (unknown
+        //    motion) and the angle wrap could alias.
+        if (!reinit_boundary && item.telem.valid && last_kf_telem_valid_) {
             const double psi_k  = psiRad(item.telem);
             const double d_psi  = wrap_angle(psi_k - last_kf_psi_rad_);
             const double max_step = config_.delta_yaw_max_step_deg * DEG_TO_RAD;
@@ -406,13 +448,15 @@ private:
                 gtsam::noiseModel::Isotropic::Sigma(1, config_.agl_sigma_m));
         }
 
-        // Initial estimates: propagate the pose with the current scale.
+        // Initial estimates: propagate the pose with the current scale. At a
+        // boundary the fresh prior mean (1.0) is the better scale guess.
+        const double scale_guess = reinit_boundary ? 1.0 : scale_est_;
         gtsam::Values values;
         const gtsam::Pose3 guess =
             gtsam::Pose3(T_enu_c_last_kf_.matrix())
-                .compose(gtsam::Pose3(rel.rotation(), rel.translation() * scale_est_));
+                .compose(gtsam::Pose3(rel.rotation(), rel.translation() * scale_guess));
         values.insert(X(k), guess);
-        values.insert(S(k), scale_est_);
+        values.insert(S(k), scale_guess);
         values.insert(B(k), bias_est_);
 
         gtsam::FixedLagSmoother::KeyTimestampMap stamps;
@@ -437,11 +481,52 @@ private:
         if (item.telem.valid) {
             last_kf_psi_rad_ = psiRad(item.telem);
         }
+        saw_non_tracking_since_kf_ = false;
         ++keyframe_count_;
 
+        kf_registry_.push_back({k, item.res.frame_id});
+        rebuildLagWindow();
+
+        if (reinit_boundary) {
+            spdlog::info("FusionModule: post-reinit boundary at X({}) (frame {}) — "
+                         "scale restarted at 1.0, VO trans sigma ×{:.1f}, "
+                         "delta-yaw skipped",
+                         k, item.res.frame_id, config_.reinit_trans_inflation);
+        }
         spdlog::debug("FusionModule: keyframe X({}) inserted (frame {}, s={:.4f}, "
                       "b={:.2f} m, {} KFs in graph history)",
                       k, item.res.frame_id, scale_est_, bias_est_, keyframe_count_);
+    }
+
+    //! Rebuild the lag-window snapshot after a successful smoother update.
+    //! A key that the fixed-lag window has marginalized out no longer exists
+    //! in calculateEstimate()'s Values (values.exists(X(k)) is false) — those
+    //! registry entries are pruned for good (a marginalized key never comes
+    //! back). Surviving keyframes are stored in registry order, which is
+    //! insertion order = ascending k = ascending frame_id. Runs on the
+    //! process() thread only; the snapshot swap shares mtx_latest_ with
+    //! latest()/getLagWindow().
+    void rebuildLagWindow() {
+        const gtsam::Values values = smoother_->calculateEstimate();
+
+        std::vector<KeyframeEntry>  live;
+        std::vector<FusionLagPose>  window;
+        live.reserve(kf_registry_.size());
+        window.reserve(kf_registry_.size());
+        for (const auto& entry : kf_registry_) {
+            if (!values.exists(X(entry.k))) {
+                continue;  // marginalized out of the fixed-lag window — prune
+            }
+            live.push_back(entry);
+            FusionLagPose lp;
+            lp.frame_id         = entry.frame_id;
+            lp.T_enu_c.matrix() = values.at<gtsam::Pose3>(X(entry.k)).matrix();
+            window.push_back(std::move(lp));
+        }
+        kf_registry_.swap(live);
+
+        std::lock_guard<std::mutex> lock(mtx_latest_);
+        lag_window_ = std::move(window);
     }
 
     FusionHealth currentHealth() const {
@@ -486,9 +571,19 @@ private:
     std::vector<std::function<void(const FusionResult&)>> callbacks_;
     std::mutex                                            mtx_callbacks_;
 
-    // Newest result snapshot.
-    FusionResult       latest_;
-    mutable std::mutex mtx_latest_;
+    // Newest result snapshot + corrected lag-window snapshot (same mutex).
+    FusionResult               latest_;
+    std::vector<FusionLagPose> lag_window_;
+    mutable std::mutex         mtx_latest_;
+
+    //! One inserted keyframe: smoother key index k ↔ source frame id. The
+    //! registry (process()-thread only) tracks which X(k) are still alive in
+    //! the fixed-lag window; pruned in rebuildLagWindow().
+    struct KeyframeEntry {
+        unsigned int k        = 0;
+        unsigned int frame_id = 0;
+    };
+    std::vector<KeyframeEntry> kf_registry_;
 
     // Graph state — touched only by process() (single consumer: the fusion
     // thread in async mode, the caller's thread in sync mode).
@@ -509,6 +604,11 @@ private:
     // Telemetry azimuth at the last keyframe (delta-yaw factor endpoints).
     double last_kf_psi_rad_     = 0.0;
     bool   last_kf_telem_valid_ = false;
+
+    //! True when a non-TRACKING VO result (LOST or NOT_INITIALIZED) was seen
+    //! since the previous keyframe → the next keyframe is a post-reinit
+    //! boundary. Cleared on initialize() and after every keyframe.
+    bool saw_non_tracking_since_kf_ = false;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -536,6 +636,10 @@ void FusionModule::add_result_callback(std::function<void(const FusionResult&)> 
 
 FusionResult FusionModule::latest() const {
     return impl_->latest();
+}
+
+std::vector<FusionLagPose> FusionModule::getLagWindow() const {
+    return impl_->getLagWindow();
 }
 
 } // namespace uavloc::fusion

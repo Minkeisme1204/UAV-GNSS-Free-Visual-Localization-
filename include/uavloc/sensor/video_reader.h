@@ -24,6 +24,13 @@ struct VideoReaderConfig {
     std::string camera_id   = "camera0";
     std::string source_name = "video_file";
 
+    // Optional output resize: when BOTH are > 0, every decoded frame is resized
+    // to exactly (resize_width x resize_height) before being published in
+    // FrameData. The Camera intrinsics in the mission config must be calibrated
+    // for the TARGET resolution. 0 (default) = publish at native resolution.
+    int resize_width  = 0;
+    int resize_height = 0;
+
     // ── Telemetry source A: simple 10-column uavloc CSV (TelemetryCsvReader) ──
     // Optional: path to telemetry CSV; empty = no telemetry sync
     std::string telemetry_csv_path;

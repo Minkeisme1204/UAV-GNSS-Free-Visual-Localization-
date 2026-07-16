@@ -22,6 +22,8 @@ VideoReaderConfig VideoReaderConfig::fromYaml(const YAML::Node& node) {
     cfg.camera_id            = n["camera_id"].as<std::string>(cfg.camera_id);
     cfg.source_name          = n["source_name"].as<std::string>(cfg.source_name);
     cfg.telemetry_csv_path   = n["telemetry_csv_path"].as<std::string>("");
+    cfg.resize_width         = n["resize_width"].as<int>(cfg.resize_width);
+    cfg.resize_height        = n["resize_height"].as<int>(cfg.resize_height);
 
     // ── Telemetry source B: 57-column drone flight log ───────────────────────
     if (n["DroneTelemetry"]) {
@@ -60,11 +62,23 @@ bool VideoReader::open() {
         current_frame_ = config_.start_frame;
     }
 
+    const int src_w = static_cast<int>(cap_.get(cv::CAP_PROP_FRAME_WIDTH));
+    const int src_h = static_cast<int>(cap_.get(cv::CAP_PROP_FRAME_HEIGHT));
+
     spdlog::info("VideoReader: opened '{}', {}x{} @ {:.1f} fps, {} frames",
-        config_.video_path,
-        static_cast<int>(cap_.get(cv::CAP_PROP_FRAME_WIDTH)),
-        static_cast<int>(cap_.get(cv::CAP_PROP_FRAME_HEIGHT)),
-        fps_, total_frames_);
+        config_.video_path, src_w, src_h, fps_, total_frames_);
+
+    // ── Optional output resize: both dimensions required to activate ─────────
+    if ((config_.resize_width > 0) != (config_.resize_height > 0)) {
+        spdlog::warn("VideoReader: resize needs BOTH resize_width and resize_height > 0 "
+                     "(got {}x{}) — resize disabled",
+                     config_.resize_width, config_.resize_height);
+        config_.resize_width  = 0;
+        config_.resize_height = 0;
+    } else if (config_.resize_width > 0 && config_.resize_height > 0) {
+        spdlog::info("VideoReader: output resize enabled {}x{} (source {}x{})",
+                     config_.resize_width, config_.resize_height, src_w, src_h);
+    }
 
     // ── Telemetry source selection (drone-log B takes priority over simple A) ──
     const bool has_drone  = !config_.drone_telemetry.csv_path.empty();
@@ -118,6 +132,17 @@ FrameStatus VideoReader::read(FrameData& frame) {
     }
 
     if (raw.empty()) return FrameStatus::EMPTY_FRAME;
+
+    // Resize BEFORE any grayscale conversion so every downstream consumer sees
+    // the target resolution (intrinsics must be calibrated for it).
+    if (config_.resize_width > 0 && config_.resize_height > 0 &&
+        (raw.cols != config_.resize_width || raw.rows != config_.resize_height)) {
+        cv::Mat resized;
+        cv::resize(raw, resized,
+                   cv::Size(config_.resize_width, config_.resize_height),
+                   0, 0, cv::INTER_AREA);
+        raw = resized;
+    }
 
     ++current_frame_;
 

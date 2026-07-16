@@ -30,11 +30,23 @@ struct FusionConfig {
     double agl_sigma_m         = 7.0;    //!< AGL Z measurement
     double agl_bias_walk_m     = 0.5;    //!< AGL bias random walk per keyframe
     double agl_bias_prior_sigma_m = 5.0; //!< AGL bias prior on b(0)
-    double scale_walk_sigma    = 0.01;   //!< scale random walk per keyframe
-    double scale_prior_sigma   = 0.2;    //!< scale init prior on S(0)
+    //! Scale random walk per keyframe. Scale is nearly unobservable from
+    //! level flight (constant altitude, no VPR X/Y fixes), so the walk must
+    //! be tight: a loose walk lets VO Z-drift alias into s(k) (observed:
+    //! s slid 1.0 → 0.09 over 193 KFs at 0.01). s(k) only needs freedom once
+    //! VPR X/Y or altitude maneuvers make it observable (F2).
+    double scale_walk_sigma    = 0.001;
+    //! Scale init prior on S(0) (and the fresh restart prior at re-init
+    //! boundaries). Tight for the same reason as scale_walk_sigma: VO is
+    //! metric-seeded from altitude, so s ≈ 1 is a strong measurement.
+    double scale_prior_sigma   = 0.02;
     double theta_init_deg      = 46.0;   //!< mount-azimuth prior mean
     double theta_sigma_deg     = 10.0;   //!< mount-azimuth prior sigma
     double anchor_xy_sigma_m   = 100.0;  //!< weak X/Y anchor on X(0)
+    //! Multiplier on vo_trans_sigma_m for the ScaledVOFactor at a post-reinit
+    //! boundary keyframe: the welded pose across a LOST gap is an assumption
+    //! (VOModule pose-continuity weld), not a measurement.
+    double reinit_trans_inflation = 10.0;
 
     //! Huber robust-kernel parameter.
     double huber_k = 1.345;
