@@ -6,9 +6,10 @@
 //
 //   * The VO pipeline runs on a WORKER thread; DebugViewer::run() owns the MAIN
 //     thread (GL singleton, blocking live window). A shared std::atomic<bool>
-//     stop_requested coordinates shutdown: the worker sets it when the video ends
-//     and calls viewer.stop(); when the user closes the window run() returns and
-//     the main thread flags the worker, then joins.
+//     stop_requested coordinates shutdown: when the video ends the worker just
+//     logs and returns — the window STAYS OPEN with the full visualization until
+//     the user closes it; run() then returns and the main thread flags the
+//     worker (no-op if already finished) and the perf sampler, then joins both.
 //   * viewer.loadBatch({}) -> live push mode. Per processed frame the worker pushes
 //     the groundtruth pose (telemetry lat/lon/alt -> ENU via gps_to_enu.h) and,
 //     once a 4-DoF gravity-aligned (yaw + translation, roll/pitch locked by the
@@ -33,6 +34,9 @@
 #include "uavloc/sensor/video_reader.h"
 #include "uavloc/new_vo/vo_config.h"
 #include "uavloc/new_vo/vo_module.h"
+#include "uavloc/fusion/fusion_config.h"
+#include "uavloc/fusion/fusion_data.h"
+#include "uavloc/fusion/fusion_module.h"
 
 #include <Eigen/Core>
 #include <spdlog/cfg/env.h>
@@ -56,8 +60,10 @@
 #include <opencv2/imgproc.hpp>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <mutex>
 #include <thread>
+#include <tuple>
 #include <utility>
 #endif
 
@@ -205,9 +211,11 @@ int main(int argc, char** argv) {
 
     sensor::VideoReaderConfig reader_cfg;
     vo::VOConfig              vo_cfg;
+    fusion::FusionConfig      fusion_cfg;
     try {
         reader_cfg = sensor::VideoReaderConfig::fromYaml(yaml);
         vo_cfg     = vo::VOConfig::fromYaml(yaml);
+        fusion_cfg = fusion::FusionConfig::fromYaml(yaml);  // defaults if no Fusion: key
     } catch (const std::exception& e) {
         spdlog::error("Failed to parse config: {}", e.what());
         return 1;
@@ -223,6 +231,16 @@ int main(int argc, char** argv) {
                  reader.getFps(), reader.getFrameCount());
 
     vo::VOModule vo_module(vo_cfg);
+
+    // Fusion back-end (F1). async_enabled from the YAML is honoured (default
+    // true = fusion runs on its own thread — the intended live mode; callbacks
+    // then fire on the fusion thread).
+    fusion::FusionModule fusion(fusion_cfg);
+    // Count of fused poses forwarded to the viewer (logged at shutdown).
+    std::atomic<std::size_t> fused_pushed{0};
+    // Count of lag-window corrections forwarded to the viewer (one per
+    // keyframe smoother update after the display anchor exists).
+    std::atomic<std::size_t> fused_corrections{0};
 
     // ── Latest keyframe map-point cloud (world, metres), captured on the worker
     //    thread via the VOData publish callback. Guarded by a mutex because the
@@ -307,6 +325,8 @@ int main(int argc, char** argv) {
         yaml["DebugViewer"]["est_odom_every_n"].as<int>(viewer_cfg.est_odom_every_n);
     viewer_cfg.est_odom_axes_scale =
         yaml["DebugViewer"]["est_odom_axes_scale"].as<float>(viewer_cfg.est_odom_axes_scale);
+    viewer_cfg.show_fused =
+        yaml["DebugViewer"]["show_fused"].as<bool>(viewer_cfg.show_fused);
     const int video_stride = std::max(1, viewer_cfg.video_stride);
     // Minimum per-frame baseline (metres) before the COG heading is refreshed
     // (anti-jitter when hovering / near-stationary). Same key as the old test.
@@ -342,6 +362,86 @@ int main(int argc, char** argv) {
     bool            has_last_pos        = false;
     double          trajectory_length_m = 0.0;
     double          last_cog_heading_deg = 0.0;
+
+    // ── Fused-trajectory display anchor ──────────────────────────────────────
+    // The fused pose is metric ENU but anchored at (0, 0, agl_0) with a constant
+    // unknown yaw offset (the mount azimuth θ) — by design in F1. For display we
+    // only ANCHOR-TRANSLATE: capture the FIRST fused position f0 and the
+    // groundtruth ENU position g0 current at that moment, then push
+    // g0 + (f - f0). The residual constant yaw offset between the fused and GT
+    // lines is EXPECTED (θ is unobservable until VPR/F2) — do NOT rotate it
+    // away; seeing it is diagnostic. Guarded by fused_mutex: the worker writes
+    // latest_gt_enu while the fusion thread reads it in the result callback.
+    std::mutex      fused_mutex;
+    bool            latest_gt_valid = false;
+    Eigen::Vector3d latest_gt_enu   = Eigen::Vector3d::Zero();
+    bool            fused_f0_set    = false;
+    bool            fused_g0_set    = false;
+    Eigen::Vector3d fused_f0        = Eigen::Vector3d::Zero();
+    Eigen::Vector3d fused_g0        = Eigen::Vector3d::Zero();
+    // Fused poses arriving before any groundtruth exists are buffered until g0
+    // can be captured, then flushed anchor-translated (position + orientation;
+    // the frame id rides along for the viewer's correction splicing).
+    std::vector<std::tuple<uint64_t, Eigen::Vector3d, Eigen::Quaterniond>>
+        fused_pending;
+
+    // Fires on the FUSION thread in async mode — the DebugViewer push methods
+    // are thread-safe. The orientation is passed through as-is: the constant
+    // yaw offset θ (mount azimuth) baked into T_enu_c is EXPECTED — do NOT
+    // correct it; seeing it on the fused pose axes is diagnostic.
+    fusion.add_result_callback([&](const fusion::FusionResult& fres) {
+        if (!fres.has_pose) {
+            return;
+        }
+        const Eigen::Vector3d    f = fres.T_enu_c.translation();
+        const Eigen::Quaterniond q(fres.T_enu_c.rotation());
+        std::lock_guard<std::mutex> lk(fused_mutex);
+        if (!fused_f0_set) {
+            fused_f0     = f;
+            fused_f0_set = true;
+        }
+        if (!fused_g0_set) {
+            if (!latest_gt_valid) {
+                // no GT yet — buffer until g0 exists
+                fused_pending.emplace_back(fres.frame_id, f, q);
+                return;
+            }
+            fused_g0     = latest_gt_enu;
+            fused_g0_set = true;
+            for (const auto& [fid, fp, fq] : fused_pending) {
+                const Eigen::Vector3d d = fused_g0 + (fp - fused_f0);
+                viewer.pushFusedPose(d.cast<float>(), fq.cast<float>(), fid);
+                ++fused_pushed;
+            }
+            fused_pending.clear();
+        }
+        const Eigen::Vector3d d = fused_g0 + (f - fused_f0);
+        viewer.pushFusedPose(d.cast<float>(), q.cast<float>(), fres.frame_id);
+        ++fused_pushed;
+
+        // Keyframe smoother update: redraw the lag window with the corrected
+        // poses. Runs on the same thread as the smoother update (safe) and
+        // only once g0 exists (corrections before the first GT anchor are
+        // meaningless — skipped above via the pending buffer). Every lag pose
+        // goes through the SAME anchor mapping as the live pushes:
+        // g0 + (p - f0), quaternion passthrough.
+        if (fres.graph_updated) {
+            const auto window = fusion.getLagWindow();
+            std::vector<dv::FusedCorrection> corrected;
+            corrected.reserve(window.size());
+            for (const auto& lp : window) {
+                const Eigen::Vector3d    p = lp.T_enu_c.translation();
+                const Eigen::Quaterniond lq(lp.T_enu_c.rotation());
+                const Eigen::Vector3d    dp = fused_g0 + (p - fused_f0);
+                corrected.push_back({static_cast<uint64_t>(lp.frame_id),
+                                     dp.cast<float>(), lq.cast<float>()});
+            }
+            if (!corrected.empty()) {
+                viewer.pushFusedCorrection(corrected);
+                ++fused_corrections;
+            }
+        }
+    });
 #endif
 
     // VO pipeline body. Runs on a worker thread in the debug-viewer build (the
@@ -372,6 +472,10 @@ int main(int argc, char** argv) {
 
             // ── Feed the frame to the VO module (synchronous: frame -> pose) ────
             const vo::VOResult r = vo_module.process_frame(frame);
+
+            // Feed the fusion back-end (non-blocking enqueue in async mode).
+            fusion.push(r, frame.has_telemetry ? frame.telemetry
+                                               : sensor::TelemetryData{});
 
             if (r.has_pose) {
                 ++pose_successes;
@@ -478,6 +582,14 @@ int main(int argc, char** argv) {
                 gp.frame_id = static_cast<int>(r.frame_id);
                 gp.x = gt_enu.x(); gp.y = gt_enu.y(); gp.z = gt_enu.z();
                 viewer.pushGroundtruthPose(gp);
+
+                // Share the latest GT ENU with the fusion result callback (it
+                // captures g0, the GT anchor for the fused-line display).
+                {
+                    std::lock_guard<std::mutex> lk(fused_mutex);
+                    latest_gt_enu   = gt_enu;
+                    latest_gt_valid = true;
+                }
 
                 auto push_estimate = [&](int fid, const Eigen::Matrix4d& T_wc) {
                     const Eigen::Vector3d p_world = T_wc.block<3, 1>(0, 3);
@@ -658,11 +770,20 @@ int main(int argc, char** argv) {
         }
         reader.close();
 #ifdef UAVLOC_WITH_DEBUG_VIEWER
-        // Signal the viewer (main thread) that the stream is exhausted.
-        stop_requested.store(true);
-        viewer.stop();
+        // Natural end of data: do NOT stop the viewer and do NOT set
+        // stop_requested — the window stays open with the full visualization
+        // until the user closes it (viewer.run() then returns on the main
+        // thread, which sets the flag and joins us). The perf sampler keeps
+        // sampling meanwhile (idle CPU is fine to show). Headless runs are
+        // unaffected: run() returned immediately and the main thread joins
+        // this worker directly, then flags the sampler itself.
+        spdlog::info("pipeline finished ({} frames) — viewer stays open, "
+                     "close the window to exit", frames_processed);
 #endif
     };  // run_pipeline
+
+    // Spawn the fusion thread (no-op in sync mode) before any frame is pushed.
+    fusion.start();
 
 #ifdef UAVLOC_WITH_DEBUG_VIEWER
     // Performance sampler: a tiny dedicated thread that every `perf_sample_ms`
@@ -683,20 +804,30 @@ int main(int argc, char** argv) {
         }
     });
 
-    // Viewer owns the main thread (GL singleton); VO runs on a worker. When the
-    // user closes the window run() returns early — flag the worker and join.
+    // Viewer owns the main thread (GL singleton); VO runs on a worker. With a
+    // display, run() blocks until the user closes the window — whether mid-run
+    // (flag stops the worker's read loop) or after the data ended (worker
+    // already returned; join is immediate). Headless, run() returns at once and
+    // the join below simply waits for the pipeline to finish on its own.
     std::thread worker(run_pipeline);
     viewer.run();              // blocking on a display; returns immediately headless
     if (viewer.hadDisplay()) {
         stop_requested.store(true);
     }
     worker.join();
-    stop_requested.store(true);  // run_pipeline sets it too; belt-and-braces
+    stop_requested.store(true);  // sole sampler-exit signal on the headless path
     perf_sampler.join();
     spdlog::info("perf sampler: {} samples", perf_samples.load());
 #else
     run_pipeline();
 #endif
+
+    // Drain the remaining fusion queue + join the fusion thread; the result
+    // callback may still fire during stop() — the viewer pushes are safe even
+    // after run() returned (they only append to a mutex-guarded queue).
+    fusion.stop();
+    spdlog::info("fused poses pushed: {}", fused_pushed.load());
+    spdlog::info("fused corrections applied: {}", fused_corrections.load());
 
     spdlog::info("test_vo_viewer: frames_processed={} pose_successes={} final_state={}",
                  frames_processed, pose_successes,

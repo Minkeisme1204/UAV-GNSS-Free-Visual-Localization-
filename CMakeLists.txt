@@ -28,8 +28,9 @@ if(NOT TARGET yaml-cpp::yaml-cpp AND TARGET yaml-cpp)
     add_library(yaml-cpp::yaml-cpp ALIAS yaml-cpp)
 endif()
 
+find_package(GTSAM    REQUIRED)   # fusion module (installed in /usr/local)
+
 # Uncomment when the corresponding module is implemented:
-# find_package(GTSAM        REQUIRED)   # fusion module
 # find_package(onnxruntime  REQUIRED)   # vpr module
 
 # ── g2o (prebuilt in-tree, consumed by new_vo/optimize) ───────────────────────

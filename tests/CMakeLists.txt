@@ -155,6 +155,43 @@ add_test(NAME test_vo_debug COMMAND test_vo_debug)
 
 endif()  # old vo module present
 
+# ── fusion smoke (F1 skeleton: threading + GTSAM linkage, synthetic input) ────
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_fusion_smoke.cpp)
+    add_executable(test_fusion_smoke test_fusion_smoke.cpp)
+    target_link_libraries(test_fusion_smoke PRIVATE uavloc)
+    set_target_properties(test_fusion_smoke PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${TEST_OUTPUT_DIR}
+    )
+    add_test(NAME test_fusion_smoke COMMAND test_fusion_smoke)
+endif()
+
+# ── fusion factors (F1: drift-recovery on synthetic corrupted VO) ────────────
+# Includes the private src/fusion/factors.h (attitude chain + yaw helpers), so
+# it needs the src include dir and a direct gtsam link (gtsam is PRIVATE on
+# uavloc by design — the public API stays gtsam-free).
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_fusion_factors.cpp)
+    add_executable(test_fusion_factors test_fusion_factors.cpp)
+    target_link_libraries(test_fusion_factors PRIVATE uavloc gtsam)
+    target_include_directories(test_fusion_factors PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    set_target_properties(test_fusion_factors PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${TEST_OUTPUT_DIR}
+    )
+    add_test(NAME test_fusion_factors COMMAND test_fusion_factors)
+endif()
+
+# ── fusion offline evaluation driver (real pipeline → per-frame CSV) ─────────
+# Runs VideoReader → new_vo VOModule → FusionModule (forced synchronous) on a
+# mission config and dumps a per-frame CSV for offline error analysis. Public
+# API only — links like test_vo_pipeline_new. Not a ctest (needs the dataset
+# video and runs long); invoke manually with UAVLOC_VO_MAXFRAMES.
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_fusion_offline.cpp)
+    add_executable(test_fusion_offline test_fusion_offline.cpp)
+    target_link_libraries(test_fusion_offline PRIVATE uavloc)
+    set_target_properties(test_fusion_offline PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${TEST_OUTPUT_DIR}
+    )
+endif()
+
 # ── MPEG-TS reader: H.264 video + MISB ST 0601 KLV telemetry ─────────────────
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_ts_reader.cpp)
     add_executable(test_ts_reader test_ts_reader.cpp)

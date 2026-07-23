@@ -4,6 +4,8 @@
 #include <uavloc/debug_viewer/inferred_pose.h>
 #include <uavloc/debug_viewer/viewer_metrics.h>
 #include <Eigen/Core>
+#include <Eigen/Geometry>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -16,6 +18,17 @@ namespace cv { class Mat; }
 namespace spdlog { namespace sinks { class sink; } }
 
 namespace uavloc::debug_viewer {
+
+//! One smoother-corrected fused pose, keyed by the frame it belongs to.
+//! Consumed by DebugViewer::pushFusedCorrection(): the viewer drops every
+//! stored fused sample with frame_id >= the first correction's frame_id and
+//! replaces them with the corrected chain (position in display ENU metres +
+//! ENU orientation quaternion, same convention as pushFusedPose).
+struct FusedCorrection {
+    uint64_t           frame_id = 0;
+    Eigen::Vector3f    pos      = Eigen::Vector3f::Zero();
+    Eigen::Quaternionf q        = Eigen::Quaternionf::Identity();
+};
 
 class DebugViewer {
 public:
@@ -89,22 +102,36 @@ public:
         // Groundtruth data keeps accumulating while hidden — only the rendering
         // is gated; re-enabling re-uploads the full accumulated trajectory.
         bool        show_groundtruth    = true;
-        // Render the estimate trajectory as per-pose XYZ axes gizmos (one small
-        // red/green/blue coordinate frame per estimate pose, oriented by the
-        // pose roll/pitch/yaw) instead of the orange polyline. Toggled live by
-        // the "EstOdom" checkbox; toggling swaps the drawables from the same
-        // accumulated buffer (no data loss).
+        // "EstOdom" rendering STYLE selector for ALL THREE trajectories.
+        // OFF (default) = line rendering: green groundtruth polyline (+ its
+        // periodic uav_* coord-frame gizmos at coord_frame_every_n cadence),
+        // orange estimate polyline, magenta fused polyline. ON = every
+        // trajectory becomes a chain of per-pose XYZ axes gizmos, colour-coded
+        // by source: groundtruth = all 3 rays GREEN (monochrome, same green as
+        // the GT line), estimate = all 3 rays ORANGE (same orange as the
+        // estimate line), fused = standard RGB axes (X red, Y green, Z blue).
+        // The "GroundTruth"/"Fused" checkboxes stay master visibility gates in
+        // both modes — EstOdom only chooses the style. Toggled live by the
+        // "EstOdom" checkbox; toggling swaps the drawables from the same
+        // accumulated buffers (no data loss).
         bool        est_odom            = false;
-        // Draw an axes gizmo for 1 of every N estimate poses (>= 1) in EstOdom
-        // mode.
+        // In EstOdom mode, draw an axes gizmo for 1 of every N poses (>= 1);
+        // shared by all three trajectories (groundtruth / estimate / fused).
         int         est_odom_every_n    = 1;
-        // Size of the estimate pose-axes gizmos (metres; same display scaling
-        // as the groundtruth coord-frame gizmos).
+        // Length of the pose-axes rays in EstOdom mode (metres; same display
+        // scaling as the groundtruth coord-frame gizmos); shared by all three
+        // trajectories.
         float       est_odom_axes_scale = 10.0f;
         // Periodically re-center the 3D camera on the latest groundtruth point
         // (auto lookat every N points). Disable to pan/orbit freely with the
         // mouse. Toggled live by the "Follow camera" checkbox.
         bool        follow_camera       = true;
+        // Show the fused (VO+telemetry back-end) trajectory (magenta polyline).
+        // Toggled live by the "Fused" checkbox. Same semantics as the
+        // "GroundTruth" checkbox: fused data keeps accumulating while hidden —
+        // only the rendering is gated; re-enabling re-uploads the full
+        // accumulated trajectory.
+        bool        show_fused          = true;
     };
 
     DebugViewer();
@@ -127,6 +154,23 @@ public:
     // position from any thread; rendered as a discrete red marker when the "Lost
     // state poses" checkbox is enabled. Thread-safe.
     void pushLostPose(const InferredPose& p);
+    // Push a fused (VO+telemetry back-end) pose from any thread: position
+    // already in display ENU (metres) plus the ENU orientation quaternion and
+    // the source frame id (so a later pushFusedCorrection can splice the
+    // sample out). Rendered — when the "Fused" checkbox is enabled — as the
+    // magenta polyline (position only) in line mode, or as standard-RGB
+    // pose-axes gizmos (position + orientation) in EstOdom mode. Thread-safe.
+    void pushFusedPose(const Eigen::Vector3f& enu_pos,
+                       const Eigen::Quaternionf& q_enu,
+                       uint64_t frame_id);
+    // Redraw the fused trajectory's recent past with the smoother-corrected
+    // poses: remove ALL stored fused samples with
+    // frame_id >= corrected.front().frame_id, append `corrected` in order, and
+    // force a full rebuild of the fused drawables (line and/or axes per the
+    // current EstOdom mode). Subsequent pushFusedPose calls append after the
+    // correction as before. Empty input is ignored. Thread-safe (applied in
+    // the render-loop drain, in push order relative to pushFusedPose).
+    void pushFusedCorrection(const std::vector<FusedCorrection>& corrected);
     // Replace the map-point cloud (already in display ENU, metres) from any
     // thread; rendered as a 3D point cloud when the "Landmarks" checkbox is
     // enabled. Each call supersedes the previous cloud (drop-oldest snapshot).
