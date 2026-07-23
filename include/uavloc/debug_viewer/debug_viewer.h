@@ -97,6 +97,11 @@ public:
         // CPU % and RSS MB over wall time). Fed via pushPerf(); toggled live by
         // the "Performance" checkbox.
         bool        show_perf           = false;
+        // Master gate for the VO estimate trajectory — orange line, or orange
+        // axes in EstOdom mode. Toggled live by the "VO" checkbox. Estimate
+        // data keeps accumulating while hidden — only the rendering is gated;
+        // re-enabling re-uploads the full accumulated trajectory.
+        bool        show_estimate       = true;
         // Show the groundtruth trajectory (green polyline + its periodic
         // coord-frame gizmos). Toggled live by the "GroundTruth" checkbox.
         // Groundtruth data keeps accumulating while hidden — only the rendering
@@ -110,8 +115,8 @@ public:
         // by source: groundtruth = all 3 rays GREEN (monochrome, same green as
         // the GT line), estimate = all 3 rays ORANGE (same orange as the
         // estimate line), fused = standard RGB axes (X red, Y green, Z blue).
-        // The "GroundTruth"/"Fused" checkboxes stay master visibility gates in
-        // both modes — EstOdom only chooses the style. Toggled live by the
+        // The "VO"/"GroundTruth"/"Fused" checkboxes stay master visibility
+        // gates in both modes — EstOdom only chooses the style. Toggled live by the
         // "EstOdom" checkbox; toggling swaps the drawables from the same
         // accumulated buffers (no data loss).
         bool        est_odom            = false;

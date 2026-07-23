@@ -256,4 +256,68 @@ private:
     double measured_agl_m_;
 };
 
+// ── MapDepthFactor ───────────────────────────────────────────────────────────
+
+//! Map-scale unary on s(k): for a near-nadir camera over ground the median
+//! optical-axis depth of the reference keyframe's landmarks and the telemetry
+//! AGL are THE SAME physical distance expressed in two different units —
+//!   s(k) * d_vo(k) * cos(beta) = AGL(k)
+//! with d_vo in MAP UNITS (vo::VOResult::median_map_depth) and beta the
+//! off-nadir angle (cos beta = 1 for a nadir view).
+//!
+//! This is the SECOND factor touching s(k). ScaledVOFactor alone is invariant
+//! under s -> alpha*s with the pose chain rebuilt, so the map-scale drift
+//! (measured 0.295 %/keyframe) is invisible to the graph; this factor breaks
+//! that invariance with an absolute, per-keyframe measurement of the map unit.
+//!
+//! The residual is taken in LOG space so the noise model is RELATIVE: the
+//! measured spread of d_vo/AGL is ~8.5 % of the value, i.e. 1.7 m at 20 m AGL
+//! and 7.2 m at 85 m — one dimensionless sigma is then correct at every
+//! altitude.
+//!   error(1) = log(s * d_vo * cos beta) - log(agl)
+//! The map shrinks relative to metric, so d_vo < agl and the residual is
+//! negative at s = 1: the factor pushes s UP, as intended.
+//!
+//! Deliberately NO bias state: a free bias absorbs exactly the evidence this
+//! factor exists to deliver (that is how agl_bias neutralised AglFactor).
+//!
+//! Degenerate inputs (non-positive d_vo, cos beta or agl) would make log()
+//! undefined; the error is then defined to be ZERO (the factor becomes inert
+//! rather than poisoning the graph with a NaN). The caller gates on positive
+//! depth and a minimum AGL, so this never triggers in practice.
+class MapDepthFactor : public gtsam::NoiseModelFactor1<double> {
+public:
+    MapDepthFactor(gtsam::Key scale, double map_depth, double measured_agl_m,
+                   double cos_off_nadir, const gtsam::SharedNoiseModel& model)
+        : gtsam::NoiseModelFactor1<double>(model, scale),
+          map_depth_(map_depth),
+          measured_agl_m_(measured_agl_m),
+          cos_off_nadir_(cos_off_nadir) {}
+
+    gtsam::Vector error_function(const double& s) const {
+        const double predicted_agl = s * map_depth_ * cos_off_nadir_;
+        if (!(predicted_agl > 0.0) || !(measured_agl_m_ > 0.0)) {
+            return gtsam::Vector1(0.0);  // inert on degenerate input
+        }
+        return gtsam::Vector1(std::log(predicted_agl) -
+                              std::log(measured_agl_m_));
+    }
+
+    gtsam::Vector evaluateError(const double& s,
+                                gtsam::Matrix* H1 = nullptr) const override {
+        const std::function<gtsam::Vector(const double&)> fn =
+            [this](const double& a) { return error_function(a); };
+        if (H1) {
+            *H1 = gtsam::numericalDerivative11<gtsam::Vector, double>(
+                fn, s, NUMERICAL_JACOBIAN_STEP);
+        }
+        return error_function(s);
+    }
+
+private:
+    double map_depth_;      //!< d_vo — median map depth [map units]
+    double measured_agl_m_; //!< AGL [m]
+    double cos_off_nadir_;  //!< cos(beta)
+};
+
 } // namespace uavloc::fusion

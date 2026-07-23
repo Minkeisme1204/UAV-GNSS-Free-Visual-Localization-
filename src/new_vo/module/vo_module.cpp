@@ -91,6 +91,7 @@ public:
 
         res.state         = state_;
         res.num_landmarks = static_cast<int>(map_db_.get_num_landmarks());
+        fill_median_depth_diag(curr_frm, res);
         finalize_result(curr_frm, res);
         publish_data_out(res);
         return res;
@@ -545,6 +546,30 @@ private:
         if (curr_frm.pose_is_valid() && curr_frm.ref_keyfrm_) {
             last_cam_pose_from_ref_keyfrm_ = curr_frm.get_pose_cw() * curr_frm.ref_keyfrm_->get_pose_wc();
         }
+    }
+
+    //! Diagnostic only (read-only, no map/tracking state touched): median
+    //! optical-axis depth of the reference keyframe's landmarks, in MAP UNITS.
+    //! Computed on keyframes only — the median walks and sorts every landmark
+    //! of the keyframe — and left at 0.0 on every other frame. Uses the same
+    //! abs=true argument as seed_metric_scale() so both numbers are directly
+    //! comparable.
+    void fill_median_depth_diag(const data::Frame& curr_frm, VOResult& res) const {
+        if (!res.is_keyframe || !curr_frm.ref_keyfrm_) {
+            return;
+        }
+        const auto& ref_keyfrm = curr_frm.ref_keyfrm_;
+        int num_lms = 0;
+        for (const auto& lm : ref_keyfrm->get_landmarks()) {
+            if (lm) {
+                ++num_lms;
+            }
+        }
+        if (num_lms == 0) {
+            return;  // compute_median_depth() would index an empty vector
+        }
+        res.median_depth_num_lms = num_lms;
+        res.median_map_depth = static_cast<double>(ref_keyfrm->compute_median_depth(true));
     }
 
     void finalize_result(const data::Frame& curr_frm, VOResult& res) {

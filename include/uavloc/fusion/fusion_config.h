@@ -16,8 +16,12 @@ struct FusionConfig {
     //! false = inline deterministic processing on the caller's thread.
     bool async_enabled = true;
 
-    //! Fixed-lag smoother window [s].
-    double lag_seconds = 20.0;
+    //! Fixed-lag smoother window [s]. 40 s (was 20): the HoaLac sharp-turn
+    //! episode showed a ~13 s VO-vs-compass disagreement; with a 20 s lag,
+    //! early-turn keyframes were marginalized (frozen) mid-conflict, leaving
+    //! permanent kinks — 40 s lets such an episode fully resolve before any
+    //! pose freezes.
+    double lag_seconds = 40.0;
 
     // ── Noise sigmas (F1 factor table) ────────────────────────────────────
     double vo_rot_sigma_deg    = 0.3;    //!< VO relative-pose rotation
@@ -40,13 +44,33 @@ struct FusionConfig {
     //! boundaries). Tight for the same reason as scale_walk_sigma: VO is
     //! metric-seeded from altitude, so s ≈ 1 is a strong measurement.
     double scale_prior_sigma   = 0.02;
-    double theta_init_deg      = 46.0;   //!< mount-azimuth prior mean
-    double theta_sigma_deg     = 10.0;   //!< mount-azimuth prior sigma
+    //! Yaw-component sigma of the X(0) anchor PriorFactor<Pose3> (Pose3 tangent
+    //! index 2 — the near-vertical camera-z rotation for a near-nadir camera).
+    //! Loaded from the "anchor_yaw_sigma_deg" YAML key, with a backward-
+    //! compatible fallback to the deprecated "theta_sigma_deg" key (which used
+    //! to double as the mount-azimuth θ prior sigma before θ was removed).
+    double anchor_yaw_sigma_deg = 10.0;
     double anchor_xy_sigma_m   = 100.0;  //!< weak X/Y anchor on X(0)
     //! Multiplier on vo_trans_sigma_m for the ScaledVOFactor at a post-reinit
     //! boundary keyframe: the welded pose across a LOST gap is an assumption
     //! (VOModule pose-continuity weld), not a measurement.
     double reinit_trans_inflation = 10.0;
+
+    // ── Map-depth scale measurement (MapDepthFactor) ──────────────────────
+    //! Master switch for the map-depth unary on s(k). OFF by default so every
+    //! pre-existing config and result stays bit-for-bit reproducible.
+    bool   map_depth_enabled = false;
+    //! Log-relative sigma of s*d_vo*cos(beta) vs AGL. 0.085 is measured: over
+    //! 265 keyframes q = d_vo/AGL tracks the true map-scale drift with
+    //! corr = 0.915, and the residual scatter is 8.5 % RMS. That residual is
+    //! structured, not white (smoothing over 1→80 keyframes leaves it at
+    //! 0.085→0.087), so no filtering can beat this value.
+    double map_depth_sigma = 0.085;
+    //! Reject a median taken over too few landmarks (noisy median).
+    int    map_depth_min_lms = 200;
+    //! Reject near-ground samples: below a few metres AGL the ratio d_vo/AGL
+    //! explodes (measured 2.25 and 7.9 on such segments).
+    double map_depth_min_agl_m = 5.0;
 
     //! Huber robust-kernel parameter.
     double huber_k = 1.345;

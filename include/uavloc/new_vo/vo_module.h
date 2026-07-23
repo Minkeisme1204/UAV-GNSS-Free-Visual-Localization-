@@ -51,6 +51,15 @@ struct VOResult {
     int    num_landmarks = 0;
     double inlier_ratio  = 0.0;
 
+    //! Median optical-axis depth (camera-frame z) of the reference keyframe's
+    //! landmarks, in MAP UNITS (not metres). Filled on keyframes only (the
+    //! median walks and sorts every landmark of the keyframe); 0.0 otherwise.
+    //! Diagnostic only: compared against telemetry AGL it measures the map's
+    //! metric scale.
+    double median_map_depth = 0.0;
+    //! Number of landmarks that went into median_map_depth; 0 when not computed.
+    int    median_depth_num_lms = 0;
+
     //! Undistorted pixel positions of the landmarks tracked (non-outlier,
     //! valid-landmark keypoints) in this frame. Filled on TRACKING frames after
     //! the local-map pose optimization; empty otherwise. For visualization

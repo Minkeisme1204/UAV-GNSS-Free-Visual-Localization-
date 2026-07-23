@@ -8,3 +8,4 @@ config/*
 build/*
 .repo
 *.zip
+.env

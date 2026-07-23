@@ -4,7 +4,7 @@
 //
 // FusionResult is the per-frame output of the GTSAM fixed-lag smoother
 // back-end: the fused camera pose in ENU plus the auxiliary states the F1
-// graph estimates (scale S(k), mount azimuth θ, AGL bias b(k)). See
+// graph estimates (scale S(k), AGL bias b(k)). See
 // .docs/theory/heading_agl_prior_tactics.md §7 for the factor table.
 //
 // This header is intentionally gtsam-free: only Eigen/std types cross the
@@ -32,7 +32,6 @@ struct FusionResult {
     Eigen::Isometry3d T_enu_c = Eigen::Isometry3d::Identity();
 
     double scale      = 1.0;   //!< current metric-scale estimate S(k)
-    double theta_deg  = 0.0;   //!< mount-azimuth estimate θ
     double agl_bias_m = 0.0;   //!< AGL-vs-ENU-Z bias b(k)
 
     FusionHealth health   = FusionHealth::INITIALIZING;

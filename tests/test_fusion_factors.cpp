@@ -29,6 +29,8 @@
 
 #include "fusion/factors.h"  // private src/fusion header: attitude chain + yaw helper
 
+#include <gtsam/inference/Symbol.h>
+
 #include "uavloc/fusion/fusion_config.h"
 #include "uavloc/fusion/fusion_data.h"
 #include "uavloc/fusion/fusion_module.h"
@@ -77,6 +79,12 @@ constexpr double FUSED_YAW_ERR_MAX_DEG = 1.5;
 constexpr double FUSED_Z_ERR_SIGMAS    = 3.0;   // < 3·agl_sigma_m
 constexpr double FUSED_HORIZ_FRACTION  = 0.5;   // < half the raw error
 constexpr double OFFSET_RMS_TOL_M      = 0.5;
+constexpr double JACOBIAN_TOL          = 1e-5;  // numerical-derivative grade
+
+// MapDepthFactor unit check: the measured end-of-segment map shrinkage
+// (median map depth = 0.549 × AGL ⇒ true scale ≈ 1.82).
+constexpr double MAP_DEPTH_RATIO = 0.549;
+constexpr double MAP_DEPTH_SIGMA = 0.085;
 
 double heading_gt_deg(int k) {
     return (k <= LEG_KFS) ? HEADING_EAST_DEG : HEADING_NORTH_DEG;
@@ -250,6 +258,67 @@ bool check_attitude_chain() {
     return ok;
 }
 
+// ── Check 0b: MapDepthFactor sign, zero and log-relativity ─────────────────
+// The map shrinks relative to metric, so d_vo < AGL: at s = 1 the residual
+// must be NEGATIVE (the factor pushes s UP) and it must vanish at the true
+// scale s = AGL / (d_vo · cos β), independently of the absolute AGL.
+bool check_map_depth_factor() {
+    using uavloc::fusion::MapDepthFactor;
+    bool ok = true;
+
+    const auto   noise  = gtsam::noiseModel::Isotropic::Sigma(1, MAP_DEPTH_SIGMA);
+    const auto   key    = gtsam::Symbol('s', 0);
+    const double agl    = 100.0;
+    const double d_vo   = MAP_DEPTH_RATIO * agl;
+    const double s_true = 1.0 / MAP_DEPTH_RATIO;
+    const MapDepthFactor f(key, d_vo, agl, 1.0, noise);
+
+    const double e_unit = f.error_function(1.0)(0);
+    if (!(e_unit < 0.0)) {
+        spdlog::error("map-depth: residual at s=1 is {:+.4f}, expected negative "
+                      "(the factor must push s UP)", e_unit);
+        ok = false;
+    }
+    if (std::abs(e_unit - std::log(MAP_DEPTH_RATIO)) > CHAIN_TOL) {
+        spdlog::error("map-depth: residual at s=1 is {:+.6f}, expected log(ratio)",
+                      e_unit);
+        ok = false;
+    }
+    if (std::abs(f.error_function(s_true)(0)) > CHAIN_TOL) {
+        spdlog::error("map-depth: residual at the true scale is {:+.6f}, expected 0",
+                      f.error_function(s_true)(0));
+        ok = false;
+    }
+    // Log form ⇒ the residual depends only on the RATIO, not on the altitude.
+    {
+        const double         agl_hi = 10.0 * agl;
+        const MapDepthFactor f_hi(key, MAP_DEPTH_RATIO * agl_hi, agl_hi, 1.0, noise);
+        if (std::abs(f_hi.error_function(1.0)(0) - e_unit) > CHAIN_TOL) {
+            spdlog::error("map-depth: residual is altitude-dependent");
+            ok = false;
+        }
+    }
+    // Degenerate input ⇒ inert (zero residual), never NaN.
+    {
+        const MapDepthFactor f_bad(key, 0.0, agl, 1.0, noise);
+        if (f_bad.error_function(1.0)(0) != 0.0) {
+            spdlog::error("map-depth: non-positive depth did not give a zero residual");
+            ok = false;
+        }
+    }
+    // Analytic Jacobian of log(s·d·cos β) is 1/s.
+    {
+        gtsam::Matrix H;
+        f.evaluateError(s_true, &H);
+        if (std::abs(H(0, 0) - 1.0 / s_true) > JACOBIAN_TOL) {
+            spdlog::error("map-depth: dE/ds = {:.6f}, expected {:.6f}",
+                          H(0, 0), 1.0 / s_true);
+            ok = false;
+        }
+    }
+    return ok;
+}
+
 } // namespace
 
 int main() {
@@ -261,6 +330,11 @@ int main() {
         return 1;
     }
     spdlog::info("check 0 PASS: attitude-chain conventions");
+
+    if (!check_map_depth_factor()) {
+        return 1;
+    }
+    spdlog::info("check 0b PASS: MapDepthFactor sign/zero/log-relativity");
 
     const Eigen::Isometry3d T_enu_w = pose_gt_enu(0);  // world = first camera frame
     const std::vector<Eigen::Isometry3d> T_wc_gt      = build_gt_vo(T_enu_w);
@@ -319,9 +393,8 @@ int main() {
             (r.T_enu_c.translation() - gt_end.translation()).head<2>().norm();
         const double z_bound = FUSED_Z_ERR_SIGMAS * make_config().agl_sigma_m;
         spdlog::info("fused endpoint: yaw err {:+.3f}°, Z err {:+.2f} m, "
-                     "horizontal err {:.1f} m (scale {:.4f}, bias {:.2f} m, θ {:.1f}°)",
-                     yaw_err_deg, z_err_m, horiz_err_m, r.scale, r.agl_bias_m,
-                     r.theta_deg);
+                     "horizontal err {:.1f} m (scale {:.4f}, bias {:.2f} m)",
+                     yaw_err_deg, z_err_m, horiz_err_m, r.scale, r.agl_bias_m);
         if (std::abs(yaw_err_deg) >= FUSED_YAW_ERR_MAX_DEG) {
             spdlog::error("check 3 FAIL: fused yaw err {:.3f}° >= {}°",
                           yaw_err_deg, FUSED_YAW_ERR_MAX_DEG);
