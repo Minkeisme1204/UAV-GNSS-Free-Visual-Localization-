@@ -360,6 +360,10 @@ struct DebugViewer::Impl {
     bool map_points_active_ = false;
     bool show_hud_          = false;
     bool show_perf_         = false;
+    // "VO" checkbox: master gate for the VO estimate trajectory (orange
+    // polyline, or orange pose-axes chain in EstOdom mode). Estimate data
+    // keeps accumulating while hidden — same semantics as GroundTruth.
+    bool show_estimate_     = true;
     // "GroundTruth" checkbox: gates the rendering of the GT polyline + its
     // coord-frame gizmos (data keeps accumulating while hidden).
     bool show_groundtruth_  = true;
@@ -625,6 +629,7 @@ void DebugViewer::run() {
     impl_->show_lost_poses_ = impl_->cfg.show_lost_poses;
     impl_->show_hud_       = impl_->cfg.show_hud;
     impl_->show_perf_      = impl_->cfg.show_perf;
+    impl_->show_estimate_    = impl_->cfg.show_estimate;
     impl_->show_groundtruth_ = impl_->cfg.show_groundtruth;
     impl_->show_est_odom_    = impl_->cfg.est_odom;
     impl_->follow_camera_    = impl_->cfg.follow_camera;
@@ -683,6 +688,7 @@ void DebugViewer::run() {
             ImGui::Checkbox("Lost state poses", &impl_->show_lost_poses_);
             ImGui::Checkbox("HUD", &impl_->show_hud_);
             ImGui::Checkbox("Performance", &impl_->show_perf_);
+            ImGui::Checkbox("VO", &impl_->show_estimate_);
             ImGui::Checkbox("GroundTruth", &impl_->show_groundtruth_);
             ImGui::Checkbox("EstOdom", &impl_->show_est_odom_);
             ImGui::Checkbox("Follow camera", &impl_->follow_camera_);
@@ -827,23 +833,50 @@ void DebugViewer::run() {
             }
         }
     };
-    // Estimate-trajectory rendering, styled by the "EstOdom" checkbox: OFF =
-    // the orange polyline (line mode); ON = one monochrome ORANGE pose-axes
+    // Estimate-trajectory rendering, gated by the "VO" checkbox (master) with
+    // the same semantics as the GroundTruth/Fused gates — estimate buffers
+    // keep accumulating while hidden — and styled by "EstOdom": line mode =
+    // the orange polyline; EstOdom mode = one monochrome ORANGE pose-axes
     // gizmo per (est_odom_every_n-th) estimate pose, oriented by the buffered
     // per-pose roll/pitch/yaw via the same gizmoTransform helper as the GT
-    // coord frames (RGB axes belong to the fused trajectory). Toggling swaps
-    // the drawables from the SAME accumulated buffer — no data loss.
+    // coord frames (RGB axes belong to the fused trajectory). Toggling either
+    // checkbox swaps the drawables from the SAME accumulated buffer — no data
+    // loss; re-enabling re-uploads the full accumulated trajectory.
     // `new_data` forces a polyline re-upload when fresh points arrived.
     auto refresh_est_display = [&](bool new_data) {
         if (!viewer) return;
-        if (impl_->show_est_odom_) {
-            // Axes mode: drop the polyline, then upload gizmos for every pose
-            // not yet considered (covers both the back-fill right after the
-            // toggle, when est_axes_next_idx_ is 0, and fresh points).
-            if (impl_->inferred_line_active_) {
-                viewer->remove_drawable("inferred_trajectory");
-                impl_->inferred_line_active_ = false;
+        const bool line_mode = impl_->show_estimate_ && !impl_->show_est_odom_;
+        const bool axes_mode = impl_->show_estimate_ && impl_->show_est_odom_;
+        // Tear down whichever style is no longer active (stale drawables must
+        // not linger across a mode/visibility switch).
+        if (!line_mode && impl_->inferred_line_active_) {
+            viewer->remove_drawable("inferred_trajectory");
+            impl_->inferred_line_active_ = false;
+        }
+        if (!axes_mode &&
+            (!impl_->est_axes_names_.empty() || impl_->est_axes_next_idx_ != 0)) {
+            for (const std::string& name : impl_->est_axes_names_) {
+                viewer->remove_drawable(name);
             }
+            impl_->est_axes_names_.clear();
+            impl_->est_axes_next_idx_ = 0;
+        }
+        if (line_mode && impl_->inferred_points.size() >= 2) {
+            // (Re-)upload the orange polyline on fresh points, or in full when
+            // the line just became active (re-enable / axes->line swap).
+            if (new_data || !impl_->inferred_line_active_) {
+                viewer->update_drawable(
+                    "inferred_trajectory",
+                    std::make_shared<glk::ThinLines>(impl_->inferred_points,
+                                                     /*line_strip=*/true),
+                    guik::FlatColor(INFERRED_COLOR[0], INFERRED_COLOR[1],
+                                    INFERRED_COLOR[2], INFERRED_COLOR[3]));
+                impl_->inferred_line_active_ = true;
+            }
+        } else if (axes_mode) {
+            // Upload an orange axes gizmo for every pose not yet considered
+            // (covers both the back-fill right after the toggle, when
+            // est_axes_next_idx_ is 0, and fresh points).
             const std::size_t every = static_cast<std::size_t>(
                 std::max(1, impl_->cfg.est_odom_every_n));
             while (impl_->est_axes_next_idx_ < impl_->inferred_points.size()) {
@@ -859,28 +892,6 @@ void DebugViewer::run() {
                     guik::FlatColor(INFERRED_COLOR[0], INFERRED_COLOR[1],
                                     INFERRED_COLOR[2], INFERRED_COLOR[3], T));
                 impl_->est_axes_names_.push_back(name);
-            }
-        } else {
-            // Line mode: tear down any axes (toggle-off), then (re-)upload the
-            // orange polyline exactly as before.
-            const bool just_switched = !impl_->est_axes_names_.empty() ||
-                                       impl_->est_axes_next_idx_ != 0;
-            if (just_switched) {
-                for (const std::string& name : impl_->est_axes_names_) {
-                    viewer->remove_drawable(name);
-                }
-                impl_->est_axes_names_.clear();
-                impl_->est_axes_next_idx_ = 0;
-            }
-            if ((new_data || just_switched) &&
-                impl_->inferred_points.size() >= 2) {
-                viewer->update_drawable(
-                    "inferred_trajectory",
-                    std::make_shared<glk::ThinLines>(impl_->inferred_points,
-                                                     /*line_strip=*/true),
-                    guik::FlatColor(INFERRED_COLOR[0], INFERRED_COLOR[1],
-                                    INFERRED_COLOR[2], INFERRED_COLOR[3]));
-                impl_->inferred_line_active_ = true;
             }
         }
     };
@@ -1119,8 +1130,9 @@ void DebugViewer::run() {
             impl_->fused_axes_names_.clear();
             impl_->fused_axes_next_idx_ = 0;
         }
-        // Estimate display: always called so the EstOdom checkbox toggle is
-        // honoured even when no new points arrived this pass.
+        // Estimate display: always called so the "VO"/"EstOdom" checkbox
+        // toggles are honoured even when no new points arrived this pass
+        // (remove on disable / style swap / full re-upload on re-enable).
         refresh_est_display(!local.empty() || !est_local.empty());
         if (!gt_local.empty())                    refresh_gt_line();
         // Fused display: rebuild on new points; otherwise still called so the

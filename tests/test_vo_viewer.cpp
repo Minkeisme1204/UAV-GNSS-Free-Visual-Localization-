@@ -317,6 +317,8 @@ int main(int argc, char** argv) {
         yaml["DebugViewer"]["show_hud"].as<bool>(viewer_cfg.show_hud);
     viewer_cfg.show_perf =
         yaml["DebugViewer"]["show_perf"].as<bool>(viewer_cfg.show_perf);
+    viewer_cfg.show_estimate =
+        yaml["DebugViewer"]["show_estimate"].as<bool>(viewer_cfg.show_estimate);
     viewer_cfg.show_groundtruth =
         yaml["DebugViewer"]["show_groundtruth"].as<bool>(viewer_cfg.show_groundtruth);
     viewer_cfg.est_odom =

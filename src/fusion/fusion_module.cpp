@@ -39,16 +39,24 @@ constexpr std::size_t QUEUE_SOFT_WARN_DEPTH = 32;
 //! A convention of "infinity", not a mission tunable.
 constexpr double LOOSE_SIGMA = 1e9;
 
+// Gimbal-tilt convention, mirrored EXACTLY from new_vo's
+// VOModule::seed_metric_scale(): tilt is measured from the horizontal plane,
+// 90 deg = nadir, so the off-nadir angle is (90 - tilt); a tilt outside the
+// plausible band falls back to a nadir assumption (off-nadir = 0). Frame
+// conventions, not mission tunables — same status as LOOSE_SIGMA.
+constexpr double GIMBAL_TILT_NADIR_DEG     = 90.0;
+constexpr double GIMBAL_TILT_MIN_VALID_DEG = 45.0;
+//! Below this cos(off-nadir) the depth↔AGL relation degenerates (grazing view).
+constexpr double MIN_COS_OFF_NADIR = 1e-6;
+
 constexpr double MSEC_TO_SEC = 1e-3;
 constexpr double DEG_TO_RAD  = M_PI / 180.0;
 constexpr double RAD_TO_DEG  = 180.0 / M_PI;
 
 // State keys (gtsam::Symbol): x(k) Pose3 T_enu_camera, s(k) VO scale
-// multiplier, b(k) AGL-vs-ENU-Z bias, t(0) mount azimuth θ [rad] (single
-// constant key — rides on its prior until VPR makes it observable, F2).
+// multiplier, b(k) AGL-vs-ENU-Z bias.
 using gtsam::symbol_shorthand::B;
 using gtsam::symbol_shorthand::S;
-using gtsam::symbol_shorthand::T;
 using gtsam::symbol_shorthand::X;
 
 } // namespace
@@ -57,8 +65,7 @@ using gtsam::symbol_shorthand::X;
 
 struct FusionModule::Impl {
     explicit Impl(const FusionConfig& config)
-        : config_(config),
-          theta_est_rad_(config.theta_init_deg * DEG_TO_RAD) {}
+        : config_(config) {}
 
     ~Impl() {
         stop();
@@ -229,7 +236,6 @@ private:
     void fillAuxStates(FusionResult& out) const {
         out.scale      = scale_est_;
         out.agl_bias_m = bias_est_;
-        out.theta_deg  = theta_est_rad_ * RAD_TO_DEG;
         out.health     = currentHealth();
     }
 
@@ -246,18 +252,28 @@ private:
         return (telem.heading_deg + telem.gimbal_pan_deg) * DEG_TO_RAD;
     }
 
+    //! cos(β) of the off-nadir angle from the gimbal tilt — same derivation as
+    //! new_vo's seed_metric_scale(), so the map depth this module receives and
+    //! the depth VO used to seed its metric scale are directly comparable.
+    static double cosOffNadir(const sensor::TelemetryData& telem) {
+        double off_nadir_rad = 0.0;
+        const double tilt = telem.gimbal_tilt_deg;
+        if (tilt > GIMBAL_TILT_MIN_VALID_DEG && tilt <= GIMBAL_TILT_NADIR_DEG) {
+            off_nadir_rad = (GIMBAL_TILT_NADIR_DEG - tilt) * DEG_TO_RAD;
+        }
+        return std::cos(off_nadir_rad);
+    }
+
     //! First keyframe with valid telemetry: anchor the graph.
     //! X(0) sits at ENU position (0, 0, agl_0) with the telemetry-measured
-    //! rotation; s(0), b(0) and the constant mount-azimuth θ = t(0) get their
-    //! priors here.
+    //! rotation; s(0) and b(0) get their priors here.
     void initialize(const WorkItem& item, const Eigen::Isometry3d& T_wc) {
         smoother_ = std::make_unique<gtsam::IncrementalFixedLagSmoother>(config_.lag_seconds);
 
         const Eigen::Matrix3d R_enu_c = measuredRotationEnuCamera(item.telem);
         const double          agl_0   = item.telem.altitude_m;
         const double          t0_sec  = item.res.timestamp_msec * MSEC_TO_SEC;
-        const double theta_rad        = config_.theta_init_deg * DEG_TO_RAD;
-        const double theta_sigma_rad  = config_.theta_sigma_deg * DEG_TO_RAD;
+        const double anchor_yaw_sigma_rad = config_.anchor_yaw_sigma_deg * DEG_TO_RAD;
 
         Eigen::Isometry3d T_anchor = Eigen::Isometry3d::Identity();
         T_anchor.linear()      = R_enu_c;
@@ -273,12 +289,13 @@ private:
 
         // Anchor prior on X(0). Pose3 tangent order: (rx, ry, rz, x, y, z).
         // Rotation: roll/pitch at telemetry-attitude grade; the yaw component
-        // (index 2 — camera z is near-vertical for a near-nadir camera) is as
-        // uncertain as the mount azimuth θ, since heading + θ set absolute yaw.
-        // Translation: weak X/Y (prevents indeterminacy pre-VPR), AGL-grade Z.
+        // (index 2 — camera z is near-vertical for a near-nadir camera) is left
+        // loose because absolute yaw is unknown at init (only heading deltas
+        // constrain it, pre-VPR). Translation: weak X/Y (prevents indeterminacy
+        // pre-VPR), AGL-grade Z.
         gtsam::Vector6 sigmas;
         sigmas << config_.rollpitch_sigma_rad, config_.rollpitch_sigma_rad,
-                  theta_sigma_rad, config_.anchor_xy_sigma_m,
+                  anchor_yaw_sigma_rad, config_.anchor_xy_sigma_m,
                   config_.anchor_xy_sigma_m, config_.agl_sigma_m;
 
         gtsam::NonlinearFactorGraph graph;
@@ -296,11 +313,6 @@ private:
             B(0), 0.0,
             gtsam::noiseModel::Isotropic::Sigma(1, config_.agl_bias_prior_sigma_m));
 
-        // θ = t(0): mount azimuth, constant. Participates in NO other factor
-        // in F1 (F2 wires it once VPR X/Y fixes make it observable).
-        graph.emplace_shared<gtsam::PriorFactor<double>>(
-            T(0), theta_rad, gtsam::noiseModel::Isotropic::Sigma(1, theta_sigma_rad));
-
         // AGL measurement on the very first state (gated like every keyframe).
         if (item.telem.altitude_m > 0.0) {
             graph.emplace_shared<AglFactor>(
@@ -312,20 +324,17 @@ private:
         values.insert(X(0), pose0);
         values.insert(S(0), 1.0);
         values.insert(B(0), 0.0);
-        values.insert(T(0), theta_rad);
 
         gtsam::FixedLagSmoother::KeyTimestampMap stamps;
         stamps[X(0)] = t0_sec;
         stamps[S(0)] = t0_sec;
         stamps[B(0)] = t0_sec;
-        stamps[T(0)] = t0_sec;
 
         smoother_->update(graph, values, stamps);
 
         T_enu_c_last_kf_.matrix() = smoother_->calculateEstimate<gtsam::Pose3>(X(0)).matrix();
         scale_est_                = smoother_->calculateEstimate<double>(S(0));
         bias_est_                 = smoother_->calculateEstimate<double>(B(0));
-        theta_est_rad_            = smoother_->calculateEstimate<double>(T(0));
 
         T_wc_last_kf_        = T_wc;
         last_kf_frame_id_    = item.res.frame_id;
@@ -448,6 +457,36 @@ private:
                 gtsam::noiseModel::Isotropic::Sigma(1, config_.agl_sigma_m));
         }
 
+        // 6. Map-depth scale measurement (Huber-robust) — the second factor
+        //    touching s(k), which is what makes the map scale observable at
+        //    all (the ScaledVOFactor alone is invariant under s → α·s). Added
+        //    at re-init boundaries too: it is an independent ABSOLUTE
+        //    measurement, unlike the scale random walk. Gated on a keyframe
+        //    median over enough landmarks and a plausible flight AGL — near
+        //    the ground d_vo/AGL explodes and would poison the scale state.
+        if (config_.map_depth_enabled && item.res.median_map_depth > 0.0 &&
+            item.res.median_depth_num_lms >= config_.map_depth_min_lms &&
+            item.telem.valid &&
+            item.telem.altitude_m >= config_.map_depth_min_agl_m) {
+            const double cos_beta = cosOffNadir(item.telem);
+            if (cos_beta > MIN_COS_OFF_NADIR) {
+                const auto md_noise = gtsam::noiseModel::Robust::Create(
+                    gtsam::noiseModel::mEstimator::Huber::Create(config_.huber_k),
+                    gtsam::noiseModel::Isotropic::Sigma(1, config_.map_depth_sigma));
+                graph.emplace_shared<MapDepthFactor>(
+                    S(k), item.res.median_map_depth, item.telem.altitude_m,
+                    cos_beta, md_noise);
+                spdlog::debug("FusionModule: map-depth factor at S({}) — "
+                              "d_vo={:.3f} ({} lms), agl={:.2f} m, "
+                              "cosβ={:.4f}, s_meas={:.4f}",
+                              k, item.res.median_map_depth,
+                              item.res.median_depth_num_lms,
+                              item.telem.altitude_m, cos_beta,
+                              item.telem.altitude_m /
+                                  (item.res.median_map_depth * cos_beta));
+            }
+        }
+
         // Initial estimates: propagate the pose with the current scale. At a
         // boundary the fresh prior mean (1.0) is the better scale guess.
         const double scale_guess = reinit_boundary ? 1.0 : scale_est_;
@@ -463,16 +502,12 @@ private:
         stamps[X(k)] = t_sec;
         stamps[S(k)] = t_sec;
         stamps[B(k)] = t_sec;
-        // Refresh the constant θ key so the fixed-lag window never
-        // marginalizes it out.
-        stamps[T(0)] = t_sec;
 
         smoother_->update(graph, values, stamps);
 
         T_enu_c_last_kf_.matrix() = smoother_->calculateEstimate<gtsam::Pose3>(X(k)).matrix();
         scale_est_                = smoother_->calculateEstimate<double>(S(k));
         bias_est_                 = smoother_->calculateEstimate<double>(B(k));
-        theta_est_rad_            = smoother_->calculateEstimate<double>(T(0));
 
         T_wc_last_kf_        = T_wc;
         last_kf_frame_id_    = item.res.frame_id;
@@ -599,7 +634,6 @@ private:
     // Latest auxiliary-state estimates (read back after every smoother update).
     double scale_est_     = 1.0;  //!< s(k_last)
     double bias_est_      = 0.0;  //!< b(k_last)
-    double theta_est_rad_ = 0.0;  //!< θ = t(0); init from config in the ctor
 
     // Telemetry azimuth at the last keyframe (delta-yaw factor endpoints).
     double last_kf_psi_rad_     = 0.0;

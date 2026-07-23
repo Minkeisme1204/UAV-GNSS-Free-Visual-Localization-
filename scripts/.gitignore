@@ -1,0 +1,4 @@
+# Local virtualenv for the MUN-FRL decoding scripts (see requirements.txt).
+.env/
+__pycache__/
+*.pyc

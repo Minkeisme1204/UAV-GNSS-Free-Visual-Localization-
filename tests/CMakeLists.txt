@@ -192,6 +192,21 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_fusion_offline.cpp)
     )
 endif()
 
+# ── full-flight evaluation driver (groundtruth-vs-fused CSV + FPS) ───────────
+# Forces VO async + wait_for_local_bundle_adjustment and fusion sync; logs
+# per-frame groundtruth ENU, fused prediction, tracked landmarks, coordinate
+# errors and processing time. Needs src/debug_viewer for the header-only
+# gps_to_enu.h (no viewer lib dependency). Not a ctest (needs the dataset
+# video and runs long); invoke manually, optionally with UAVLOC_VO_MAXFRAMES.
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_full_flight.cpp)
+    add_executable(test_full_flight test_full_flight.cpp)
+    target_link_libraries(test_full_flight PRIVATE uavloc)
+    target_include_directories(test_full_flight PRIVATE ${CMAKE_SOURCE_DIR}/src/debug_viewer)
+    set_target_properties(test_full_flight PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${TEST_OUTPUT_DIR}
+    )
+endif()
+
 # ── MPEG-TS reader: H.264 video + MISB ST 0601 KLV telemetry ─────────────────
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_ts_reader.cpp)
     add_executable(test_ts_reader test_ts_reader.cpp)

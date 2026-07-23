@@ -16,8 +16,8 @@
 //
 // F1 graph (see .docs/theory/heading_agl_prior_tactics.md §5.3/§6/§7):
 // states x(k) Pose3 T_enu_camera, s(k) VO-scale multiplier, b(k) AGL-vs-ENU-Z
-// bias, t(0) mount azimuth θ (constant, prior-only until F2/VPR). Per-keyframe
-// factors: ScaledVOFactor (Huber), scale/bias random walks, offset-immune
+// bias. Per-keyframe factors: ScaledVOFactor (Huber), scale/bias random walks,
+// offset-immune
 // DeltaYawFactor (heading deltas, slew-rate gated), rotation-only roll/pitch
 // attitude prior (yaw loose), AGL Z factor. X(0) is anchored at ENU
 // (0, 0, agl_0) with the telemetry-measured rotation.
