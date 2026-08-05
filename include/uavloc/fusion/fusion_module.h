@@ -24,6 +24,7 @@
 //
 // This header is gtsam-free; all GTSAM usage stays in src/fusion/.
 
+#include "uavloc/anchor/absolute_fix.h"
 #include "uavloc/fusion/fusion_config.h"
 #include "uavloc/fusion/fusion_data.h"
 #include "uavloc/new_vo/vo_module.h"
@@ -56,6 +57,29 @@ public:
     //! (enqueues); runs inline in sync mode. Keyframes trigger a graph update,
     //! other frames only propagate the output pose.
     void push(const vo::VOResult& res, const sensor::TelemetryData& telem);
+
+    //! Hand an absolute horizontal position measurement to the back-end
+    //! (M1). Thread-safe and non-blocking in both modes: the fix is queued
+    //! (drop-oldest — a stale fix is worthless and must never stall the
+    //! pipeline) and consumed at the next keyframe graph update, which
+    //! attaches it to the keyframe state X(k) closest in time (within
+    //! FusionConfig::fix_match_tolerance_sec). A fix whose keyframe has already
+    //! left the fixed-lag window is dropped (FusionFixStats::marginalized), as
+    //! is one older than the age budget (FusionFixStats::age_expired); one that
+    //! is still inside the window corrects the PAST as well as the present.
+    //!
+    //! Fixes with valid == false, a non-finite position or a non-SPD
+    //! covariance are rejected outright (not counted as injected).
+    //!
+    //! ⚠ Quality filtering is the PRODUCER's job: the consumer only checks
+    //! AbsoluteFix::confidence against FusionConfig::fix_min_confidence (0 by
+    //! default). The self-consistency Mahalanobis gate is off by default —
+    //! with the M1 fake anchor (confidence always 1.0) nothing rejects a wrong
+    //! fix, so a VPR producer must supply a real confidence and covariance.
+    void push_absolute_fix(const anchor::AbsoluteFix& fix);
+
+    //! Thread-safe snapshot of the cumulative absolute-fix accounting.
+    FusionFixStats fix_stats() const;
 
     //! Register a subscriber invoked once per processed frame, in registration
     //! order, on the processing thread (fusion thread in async mode).

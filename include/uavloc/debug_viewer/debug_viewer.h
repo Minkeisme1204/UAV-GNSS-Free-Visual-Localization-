@@ -6,6 +6,7 @@
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -30,8 +31,52 @@ struct FusedCorrection {
     Eigen::Quaternionf q        = Eigen::Quaternionf::Identity();
 };
 
+//! One ABSOLUTE-POSITION measurement, drawn as a discrete marker so it can be
+//! seen next to the trajectories it is supposed to correct. `pos` is in the
+//! same display ENU metres as pushFusedPose(), i.e. the caller has already
+//! applied whatever anchor mapping the fused line uses — the viewer does not
+//! know about coordinate frames.
+//!
+//! `accepted` is the CONSUMER's verdict (did the back-end actually use it),
+//! not the producer's opinion; a marker whose verdict is not known yet is
+//! simply pushed as not accepted and re-pushed later. See
+//! DebugViewer::setAnchorFixes().
+//! `from_reinit` marks a RE-ANCHOR measurement — one requested because the VO
+//! chain had just been re-initialized, not because the regular cadence came
+//! round. It is drawn as a SQUARE instead of a circle so the two are told apart
+//! at a glance: whether re-anchoring fires at all is the whole question those
+//! runs exist to answer, and a picture that merges them cannot answer it.
+struct AnchorFixMarker {
+    Eigen::Vector3f pos         = Eigen::Vector3f::Zero();
+    bool            accepted    = false;
+    bool            from_reinit = false;
+};
+
 class DebugViewer {
 public:
+    //! State of the run-control button drawn on the main panel. The viewer
+    //! knows nothing about what is being run — it only tracks which of the two
+    //! labels to draw ("Start" when IDLE or PAUSED, "Stop" when RUNNING) and
+    //! reports the click.
+    //!
+    //! IDLE and PAUSED are distinct because the DRIVER usually has to do
+    //! different work for the first Start (bring the whole pipeline up) and for
+    //! a later one (resume a paused input); the button looks the same in both.
+    enum class RunState { IDLE, RUNNING, PAUSED };
+
+    //! Handler invoked (on the render thread) when the user clicks the
+    //! run-control button. `want_run` is true for Start (run / resume), false
+    //! for Stop (pause); the handler returns true if the request SUCCEEDED. On
+    //! false the button state is left untouched and the viewer logs the refusal
+    //! — the display never claims a transition that did not happen.
+    //!
+    //! Deliberately a single std::function, NOT a CallbackSlot: this is a
+    //! command with exactly one owner (the driver that owns the pipeline) and
+    //! it needs an answer back. CallbackSlot is a `void(Args...)` fan-out to N
+    //! subscribers with no return path, so it cannot carry the verdict, and
+    //! "N owners of one pipeline" is not a meaningful configuration.
+    using RunControlHandler = std::function<bool(bool want_run)>;
+
     struct Config {
         std::string window_title        = "UAV Debug Viewer";
         int         window_w            = 1280;
@@ -97,6 +142,17 @@ public:
         // CPU % and RSS MB over wall time). Fed via pushPerf(); toggled live by
         // the "Performance" checkbox.
         bool        show_perf           = false;
+        // Show the "Profiling" window: a table of the measured computation
+        // blocks with their mean/last/max runtime (ms), call count and share of
+        // the per-frame total. Fed via pushProfile(); toggled live by the
+        // "Profiling" checkbox.
+        bool        show_profile        = false;
+        // Show the "Error (m)" window: predicted-vs-groundtruth position error
+        // in metres — a per-frame line chart, a distribution histogram, and a
+        // running summary (count / mean / median / p95 / max, all recomputed as
+        // samples arrive). Fed via pushErrorSample(); toggled live by the
+        // "Error (m)" checkbox. Empty until the producer pushes.
+        bool        show_error          = false;
         // Master gate for the VO estimate trajectory — orange line, or orange
         // axes in EstOdom mode. Toggled live by the "VO" checkbox. Estimate
         // data keeps accumulating while hidden — only the rendering is gated;
@@ -137,6 +193,10 @@ public:
         // only the rendering is gated; re-enabling re-uploads the full
         // accumulated trajectory.
         bool        show_fused          = true;
+        // Show the absolute-position fix markers (setAnchorFixes): yellow where
+        // the back-end accepted the measurement, purple where it rejected it or
+        // has not judged it yet. Toggled live by the "Anchor fixes" checkbox.
+        bool        show_anchor_fixes   = true;
     };
 
     DebugViewer();
@@ -176,6 +236,22 @@ public:
     // correction as before. Empty input is ignored. Thread-safe (applied in
     // the render-loop drain, in push order relative to pushFusedPose).
     void pushFusedCorrection(const std::vector<FusedCorrection>& corrected);
+    // Replace the whole absolute-fix marker set (already in display ENU,
+    // metres) from any thread. REPLACE, not append, on purpose: a fix's
+    // accepted/rejected verdict only becomes known some frames after the
+    // measurement was made, so the producer of this list owns it and re-pushes
+    // the corrected snapshot. Thread-safe.
+    void setAnchorFixes(const std::vector<AnchorFixMarker>& fixes);
+    // Two lines of text drawn at the TOP of the viewer's main panel: a
+    // permanent RED warning and a plain status/counter line. Empty strings hide
+    // the respective line. Thread-safe.
+    //
+    // The warning line exists for one reason: a screenshot of this window must
+    // never be able to travel without the caveat that produced it (the M1 fake
+    // anchor derives its "measurements" from groundtruth). Putting the caveat
+    // in the log only would fail that test — .claude/rules/reporting.md
+    // requires the warning where the numbers are shown.
+    void setAnchorOverlay(const std::string& warning, const std::string& stats);
     // Replace the map-point cloud (already in display ENU, metres) from any
     // thread; rendered as a 3D point cloud when the "Landmarks" checkbox is
     // enabled. Each call supersedes the previous cloud (drop-oldest snapshot).
@@ -188,6 +264,16 @@ public:
     // thread; drained into the "Performance" streaming line charts by the
     // render loop (ring buffer capped at Config::perf_plot_history). Thread-safe.
     void pushPerf(const PerfSample& s);
+    // Push a profiling table snapshot from any thread; stored in a single
+    // LATEST-WINS slot (the table only ever shows the newest snapshot) and
+    // rendered by the "Profiling" window. Row order is preserved. Thread-safe.
+    void pushProfile(const ProfileSnapshot& p);
+    // Push one predicted-vs-groundtruth position error sample (metres, already
+    // paired by frame id by the producer) from any thread; drained into the
+    // "Error (m)" window's line chart, histogram and running summary by the
+    // render loop (ring buffer capped at Config::metric_plot_history).
+    // Thread-safe.
+    void pushErrorSample(const ErrorSample& s);
     // Push the latest video frame from any thread; cloned into a single
     // drop-oldest slot and uploaded as a texture by the render loop. Thread-safe.
     void pushFrame(const cv::Mat& image);
@@ -196,6 +282,19 @@ public:
     // drop-oldest slot and uploaded to the "Tracking" sub-window by the render
     // loop when the Tracking checkbox is enabled. Thread-safe.
     void pushTrackingFrame(const cv::Mat& image);
+    // Install the run-control handler. Until one is installed the button is not
+    // drawn at all (a viewer with nothing to drive — e.g. demo_debug_viewer —
+    // must not show a dead button). Pass an empty handler to remove it.
+    // Thread-safe; call before run().
+    void setRunControl(RunControlHandler handler);
+    // Set the button state from the producer side, for the transitions the user
+    // did not cause: an auto-started run (headless / dump / autostart env) is
+    // RUNNING from the outset, and a run whose data ended by itself goes back to
+    // showing "Start" (whether that click can still do anything is the
+    // handler's verdict, not the viewer's business). Thread-safe.
+    void setRunState(RunState state);
+    // Current button state. Thread-safe.
+    RunState runState() const;
     // Returns a spdlog sink that captures formatted log lines into the viewer's
     // scrolling terminal panel. Attach it to the default logger's sink list
     // before logging. Lazily created; the same instance is returned thereafter.

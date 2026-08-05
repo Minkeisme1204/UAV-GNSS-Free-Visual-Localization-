@@ -9,3 +9,4 @@ build/*
 .repo
 *.zip
 .env
+.venv

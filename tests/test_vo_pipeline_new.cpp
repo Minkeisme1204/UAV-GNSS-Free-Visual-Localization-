@@ -33,7 +33,7 @@
 
 namespace {
 const std::string DEFAULT_CONFIG_PATH =
-    "/home/minkeisrtx5090/Desktop/Workplace/HUST/uav_localization/config/uavloc_yenbai800m.yaml";
+    "/home/minkeisrtx5090/Desktop/Workplace/HUST/uav_localization/config/uavloc_yenbai800m_newvo.yaml";
 
 constexpr int MAX_FRAMES = 10000;  // hard cap on frames fed to the pipeline (smoke)
 

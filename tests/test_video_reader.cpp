@@ -5,7 +5,7 @@
 #include <yaml-cpp/yaml.h>
 
 static const std::string CONFIG_PATH =
-    "/home/minkeisrtx5090/Desktop/Workplace/HUST/uav_localization/config/uavloc_yenbai800m.yaml";
+    "/home/minkeisrtx5090/Desktop/Workplace/HUST/uav_localization/config/uavloc_yenbai800m_newvo.yaml";
 
 int main() {
     // ── Load config ───────────────────────────────────────────────────────────

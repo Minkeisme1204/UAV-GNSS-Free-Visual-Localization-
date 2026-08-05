@@ -25,6 +25,7 @@ add_subdirectory(util)
 add_subdirectory(new_vo)   # VoFrameLoader subset enabled (feature/orb + data/ + camera adapter)
 # add_subdirectory(vpr)
 add_subdirectory(fusion)   # GTSAM back-end (links gtsam PRIVATE in src/fusion/)
-# add_subdirectory(anchor)
-# add_subdirectory(core)
+add_subdirectory(anchor)   # AnchorInterface + the M1 groundtruth FakeAnchor
+add_subdirectory(core)     # SystemConfig (S2); SystemManager lands in S3
+
 # add_subdirectory(utils)

@@ -49,7 +49,7 @@ namespace uavloc {
 namespace {
 
 const std::string DEFAULT_CONFIG_PATH =
-    "/home/minkeisrtx5090/Desktop/Workplace/HUST/uav_localization/config/uavloc_yenbai800m.yaml";
+    "/home/minkeisrtx5090/Desktop/Workplace/HUST/uav_localization/config/uavloc_yenbai800m_newvo.yaml";
 
 // Number of valid frames to process before stopping. Overridable via argv[2].
 constexpr int DEBUG_MAX_FRAMES = 60;

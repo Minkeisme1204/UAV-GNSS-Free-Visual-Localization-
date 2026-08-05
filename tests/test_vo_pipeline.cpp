@@ -53,7 +53,7 @@ namespace {
 
 // Default mission config when none is supplied on the command line.
 const std::string DEFAULT_CONFIG_PATH =
-    "/home/minkeisrtx5090/Desktop/Workplace/HUST/uav_localization/config/uavloc_yenbai800m.yaml";
+    "/home/minkeisrtx5090/Desktop/Workplace/HUST/uav_localization/config/uavloc_yenbai800m_newvo.yaml";
 
 // Where the trajectory visualization is written (current working directory).
 const std::string OUTPUT_IMAGE_PATH = "vo_trajectory.png";

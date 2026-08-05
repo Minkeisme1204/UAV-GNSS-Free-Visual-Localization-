@@ -24,8 +24,13 @@ target_link_libraries(uavloc_debug_viewer
     PUBLIC
         Iridescence::iridescence
         Eigen3::Eigen
-    PRIVATE
+        # PUBLIC since S5b: the public header callback_slot.h aliases the
+        # header-only util::CallbackSlot, which logs subscriber exceptions with
+        # spdlog, so every consumer TU needs spdlog's headers. spdlog lives in
+        # .local/, not on a system include path. This is a HEADER-ONLY target —
+        # uavloc_debug_viewer still links no uavloc target (R4).
         spdlog::spdlog_header_only
+    PRIVATE
         ${OpenCV_LIBS}
         PkgConfig::ZBAR
 )

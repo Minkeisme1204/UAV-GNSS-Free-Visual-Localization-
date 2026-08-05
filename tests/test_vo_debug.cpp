@@ -15,7 +15,7 @@
 //
 // Usage (from build/):
 //     ./tests/test_vo_debug [config.yaml] [max_frames] [trajectory.png]
-// Defaults: config/uavloc_yenbai800m.yaml, DEBUG_MAX_FRAMES frames,
+// Defaults: config/uavloc_yenbai800m_newvo.yaml, DEBUG_MAX_FRAMES frames,
 //           vo_debug_trajectory.png.
 #include "uavloc/sensor/camera_model.h"
 #include "uavloc/sensor/video_reader.h"
@@ -42,7 +42,7 @@ namespace {
 // Default mission config when none is supplied on the command line (matches
 // test_vo_pipeline so both drivers share one config).
 const std::string DEFAULT_CONFIG_PATH =
-    "/home/minkeisrtx5090/Desktop/Workplace/HUST/uav_localization/config/uavloc_yenbai800m.yaml";
+    "/home/minkeisrtx5090/Desktop/Workplace/HUST/uav_localization/config/uavloc_yenbai800m_newvo.yaml";
 
 // Number of valid frames to process before stopping. Overridable via argv[2].
 constexpr int DEBUG_MAX_FRAMES = 20;

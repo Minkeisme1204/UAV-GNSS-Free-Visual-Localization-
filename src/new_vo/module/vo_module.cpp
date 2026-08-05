@@ -16,6 +16,7 @@
 #include "uavloc/new_vo/module/vo_frame_loader.h"
 #include "uavloc/new_vo/optimize/pose_optimizer.h"
 #include "uavloc/new_vo/optimize/pose_optimizer_factory.h"
+#include "uavloc/util/scoped_timer.h"
 
 #include <cmath>
 #include <cstdlib>
@@ -64,13 +65,24 @@ public:
     }
 
     VOResult process_frame(const sensor::FrameData& fd) {
+        // Profiling (disabled by default; first label wins so a driver that
+        // already named this thread keeps its own label).
+        util::Profiler::set_thread_label("tracking");
+        util::ScopedTimer _t_total(util::ProfileStage::PROCESS_FRAME_TOTAL);
+
         // Keep telemetry in parallel, keyed by frame_id (data::Frame has no
         // telemetry field — see VoFrameLoader design note).
         if (fd.has_telemetry) {
             telem_[fd.frame_id] = fd.telemetry;
         }
 
-        data::Frame curr_frm = loader_.load(fd);
+        // Immediately-invoked lambda so the timer scope wraps ONLY the load
+        // while the Frame is still constructed directly into curr_frm (no extra
+        // copy/move vs. the previous `data::Frame curr_frm = loader_.load(fd);`).
+        data::Frame curr_frm = [&] {
+            util::ScopedTimer _t(util::ProfileStage::FRAME_LOAD);
+            return loader_.load(fd);
+        }();
 
         VOResult res;
         res.frame_id       = curr_frm.id_;
@@ -113,7 +125,10 @@ private:
     // state-machine steps
 
     void process_not_initialized(data::Frame& curr_frm, VOResult& res) {
-        initializer_.initialize(camera::SetupType::Monocular, curr_frm);
+        {
+            util::ScopedTimer _t(util::ProfileStage::INIT);
+            initializer_.initialize(camera::SetupType::Monocular, curr_frm);
+        }
 
         if (initializer_.get_state() == module::InitializerState::Wrong) {
             reset_map();
@@ -181,12 +196,20 @@ private:
 
         res.num_inliers = static_cast<int>(num_tracked_lms);
 
-        // Keyframe gate.
-        if (succeeded && curr_frm.ref_keyfrm_
-            && keyframe_inserter_.new_keyframe_is_needed(&map_db_, curr_frm, num_tracked_lms,
-                                                         num_reliable_lms, *curr_frm.ref_keyfrm_, min_num_obs_thr)) {
+        // Keyframe gate (same short-circuit order; the gate call is timed).
+        bool new_keyframe_is_needed = false;
+        if (succeeded && curr_frm.ref_keyfrm_) {
+            util::ScopedTimer _t(util::ProfileStage::KF_GATE);
+            new_keyframe_is_needed = keyframe_inserter_.new_keyframe_is_needed(
+                &map_db_, curr_frm, num_tracked_lms, num_reliable_lms,
+                *curr_frm.ref_keyfrm_, min_num_obs_thr);
+        }
+        if (new_keyframe_is_needed) {
             const auto prev_kf = curr_frm.ref_keyfrm_;
-            keyframe_inserter_.insert_new_keyframe(&map_db_, curr_frm);
+            {
+                util::ScopedTimer _t(util::ProfileStage::KF_INSERT);
+                keyframe_inserter_.insert_new_keyframe(&map_db_, curr_frm);
+            }
             res.is_keyframe = true;
             if (diag_enabled_) {
                 const double baseline_since_prev_kf =
@@ -230,7 +253,10 @@ private:
     //! frame never dereferences a replaced/dead landmark.
     void on_new_keyframe(data::Frame& curr_frm) {
         MappingModule::ReplacedLandmarks replaced_lms;
-        mapping_module_.submit(curr_frm.ref_keyfrm_, replaced_lms);
+        {
+            util::ScopedTimer _t(util::ProfileStage::MAPPING_SUBMIT_WAIT);
+            mapping_module_.submit(curr_frm.ref_keyfrm_, replaced_lms);
+        }
         // Synchronous: fusion replacements are available immediately. Async:
         // replaced_lms is empty here and drained at the next tracking step.
         apply_replaced_lms(curr_frm, replaced_lms);
@@ -261,6 +287,7 @@ private:
     }
 
     bool track_current_frame(data::Frame& curr_frm) {
+        util::ScopedTimer _t(util::ProfileStage::TRACK_FRAME);
         bool succeeded = false;
         if (twist_is_valid_) {
             succeeded = tracker_.motion_based_track(curr_frm, last_frm_, velocity_);
@@ -340,9 +367,14 @@ private:
 
         // Temporal-aware overload (stella tracking_module.cc:517); identical to
         // the plain overload when the threshold is 0.
-        if (!local_map_updater_.acquire_local_map(curr_frm.get_landmarks(),
-                                                  fixed_keyframe_id_threshold,
-                                                  num_temporal_keyfrms)) {
+        bool acquired = false;
+        {
+            util::ScopedTimer _t(util::ProfileStage::LOCAL_MAP_UPDATE);
+            acquired = local_map_updater_.acquire_local_map(curr_frm.get_landmarks(),
+                                                            fixed_keyframe_id_threshold,
+                                                            num_temporal_keyfrms);
+        }
+        if (!acquired) {
             return false;
         }
         local_landmarks_ = local_map_updater_.get_local_landmarks();
@@ -359,6 +391,7 @@ private:
     //! non-temporal second pass; the first pass ignores it (pre-existing port
     //! deviation, keeps the default path byte-identical).
     bool search_local_landmarks(data::Frame& curr_frm, const unsigned int fixed_keyframe_id_threshold) {
+        util::ScopedTimer _t(util::ProfileStage::LOCAL_MAP_SEARCH);
         std::unordered_set<unsigned int> curr_landmark_ids;
         for (const auto& lm : curr_frm.get_landmarks()) {
             if (!lm || lm->will_be_erased()) {
@@ -425,7 +458,10 @@ private:
                                                VOResult& res) {
         Mat44_t optimized_pose;
         std::vector<bool> outlier_flags;
-        pose_optimizer_->optimize(curr_frm, optimized_pose, outlier_flags);
+        {
+            util::ScopedTimer _t(util::ProfileStage::LOCAL_MAP_POSE_OPT);
+            pose_optimizer_->optimize(curr_frm, optimized_pose, outlier_flags);
+        }
         curr_frm.set_pose_cw(optimized_pose);
 
         for (unsigned int idx = 0; idx < curr_frm.frm_obs_.undist_keypts_.size(); ++idx) {
@@ -605,6 +641,7 @@ private:
         if (data_out_callbacks_.empty()) {
             return;
         }
+        util::ScopedTimer _t(util::ProfileStage::PUBLISH);
         VOData data;
         data.result = res;
         if (res.is_keyframe) {

@@ -19,7 +19,7 @@ namespace {
 // Default mission config when none is supplied on the command line. Mirrors the
 // CONFIG_PATH convention used by tests/test_video_reader.cpp.
 const std::string DEFAULT_CONFIG_PATH =
-    "/home/minkeisrtx5090/Desktop/Workplace/HUST/uav_localization/config/uavloc_yenbai800m.yaml";
+    "/home/minkeisrtx5090/Desktop/Workplace/HUST/uav_localization/config/uavloc_yenbai800m_newvo.yaml";
 
 // Where the match visualization is written (current working directory).
 const std::string OUTPUT_IMAGE_PATH = "adjacent_matches.png";

@@ -1,5 +1,7 @@
 #include "uavloc/new_vo/module/vo_frame_loader.h"
 
+#include "uavloc/util/scoped_timer.h"
+
 #include <spdlog/spdlog.h>
 
 namespace uavloc {
@@ -32,7 +34,10 @@ data::Frame VoFrameLoader::load(const sensor::FrameData& fd) {
 
     // 2. Extract ORB keypoints + descriptors (no feature mask at this seam).
     std::vector<cv::KeyPoint> keypts;
-    orb_extractor_.extract(gray, cv::Mat(), keypts, frm_obs.descriptors_);
+    {
+        util::ScopedTimer _t(util::ProfileStage::ORB_EXTRACT);
+        orb_extractor_.extract(gray, cv::Mat(), keypts, frm_obs.descriptors_);
+    }
     if (keypts.empty()) {
         spdlog::warn("VoFrameLoader: no keypoints extracted from Frame {}", fd.frame_id);
     }

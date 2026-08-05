@@ -1,5 +1,6 @@
-# core module — add source files here as they are implemented
+# core module — SystemManager and friends (.docs/designs/system_manager_design.md)
 target_sources(uavloc PRIVATE
-    # system.cpp
-    # pipeline.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/extrapolator.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/system_config.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/system_manager.cpp
 )

@@ -2,6 +2,7 @@
 # Requires: find_package(GTSAM REQUIRED) in the root CMakeLists.
 target_sources(uavloc PRIVATE
     fusion_config.cpp
+    fusion_data.cpp
     fusion_module.cpp
 )
 
