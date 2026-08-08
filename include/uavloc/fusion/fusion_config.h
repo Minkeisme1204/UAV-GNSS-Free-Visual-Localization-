@@ -136,7 +136,8 @@ struct FusionConfig {
     //! 193 / 15; on MUN-FRL ds6 (full flight, rho = 0) the error slope went
     //! +33.13 m/km (tukey) → +4.30 m/km (huber).
     FixRobustKernel fix_robust_kernel = FixRobustKernel::HUBER;
-    //! Tukey kernel parameter (kcb precedent, .docs/theory/05_khoi_fusion.md).
+    //! Tukey kernel parameter (kcb precedent,
+    //! .docs/related_work/kcb_slam/05_khoi_fusion.md).
     double fix_tukey_c = 4.685;
     //! Largest |t_fix − t_keyframe| accepted when a fix is matched to a live
     //! keyframe state. This is a SYNCHRONISATION tolerance — "is this the

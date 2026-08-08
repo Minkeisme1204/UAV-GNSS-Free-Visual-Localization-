@@ -3,7 +3,9 @@
 #include <spdlog/spdlog.h>
 
 #include <cstdlib>
+#include <iomanip>
 #include <string>
+#include <utility>
 
 namespace uavloc {
 namespace eval {
@@ -15,6 +17,14 @@ namespace {
 bool env_present(const char* name) {
     const char* v = std::getenv(name);
     return v != nullptr && *v != '\0';
+}
+
+//! True iff the environment variable is set AND non-empty. `DISPLAY=` yields a
+//! non-null but empty string, which DebugViewer::run() already treats as
+//! headless; viewer_run_policy() has to agree with it exactly.
+bool env_nonempty(const char* name) {
+    const char* v = std::getenv(name);
+    return v != nullptr && v[0] != '\0';
 }
 
 //! Where a value ended up coming from, for the provenance log line below.
@@ -98,6 +108,82 @@ anchor::FakeAnchorConfig fake_anchor_config(
                  c.sigma_m,   provenance(node, "sigma_m",  "UAVLOC_FIX_SIGMA_M"),
                  c.seed,      provenance(node, "seed",     "UAVLOC_FIX_SEED"));
     return c;
+}
+
+MissionSetup load_viewer_mission(const std::string& config_path) {
+    MissionSetup m;
+    try {
+        m.yaml = YAML::LoadFile(config_path);
+    } catch (const std::exception& e) {
+        spdlog::error("driver: failed to load YAML '{}': {}", config_path,
+                      e.what());
+        return m;
+    }
+    try {
+        m.reader = sensor::VideoReaderConfig::fromYaml(m.yaml);
+        m.system = core::SystemConfig::fromYaml(m.yaml);  // VO+Fusion+Camera+System
+    } catch (const std::exception& e) {
+        spdlog::error("driver: failed to parse config '{}': {}", config_path,
+                      e.what());
+        return m;
+    }
+    // The ONE configuration key a viewer driver legitimately differs on: it
+    // only decides whether the image rides along on the debug channel.
+    m.system.publish_images = true;
+    force_offline_run_mode(m.system);
+    m.loaded = true;
+    return m;
+}
+
+std::unique_ptr<sensor::VideoDataSource> open_viewer_source(
+    const MissionSetup& mission, const char* driver_name) {
+    auto reader = std::make_unique<sensor::VideoReader>(mission.reader);
+    if (!reader->open()) {
+        spdlog::warn("{}: cannot open video '{}' — SKIPPED", driver_name,
+                     mission.reader.video_path);
+        return nullptr;  // soft-skip when the dataset is absent
+    }
+    spdlog::info("{}: video opened — fps: {:.1f}, total frames: {}", driver_name,
+                 reader->getFps(), reader->getFrameCount());
+    return std::make_unique<sensor::VideoDataSource>(
+        std::move(reader),
+        sensor::VideoDataSourceConfig::fromYaml(mission.yaml["VideoDataSource"]));
+}
+
+RunPolicy viewer_run_policy() {
+    RunPolicy p;
+    if (!env_nonempty("DISPLAY") && !env_nonempty("WAYLAND_DISPLAY")) {
+        // Regression run: it must start by itself and it must be bounded.
+        p.autostart  = true;
+        p.max_frames = static_cast<std::size_t>(PARITY_MAX_FRAMES);
+        p.reason     = "headless (no DISPLAY/WAYLAND_DISPLAY) — a REGRESSION "
+                       "run: nobody could press the Start button, and the "
+                       "frame cap keeps the gate bounded and comparable";
+    } else {
+        // Interactive session: the operator starts it and the operator ends it.
+        p.autostart  = false;
+        p.max_frames = INTERACTIVE_MAX_FRAMES;
+        p.reason     = "a DISPLAY is present — an INTERACTIVE session: the run "
+                       "waits for the viewer's Start button and is NOT capped";
+    }
+    spdlog::info("driver: run policy — autostart={}, max_frames={} ({})",
+                 p.autostart, p.max_frames,
+                 p.max_frames == 0 ? "no cap, runs to end of stream"
+                                   : "capped regression run");
+    return p;
+}
+
+std::ofstream open_pose_dump(const std::string& path, const char* driver_name) {
+    std::ofstream dump(path);
+    if (!dump.is_open()) {
+        spdlog::error("{}: cannot open pose dump '{}'", driver_name, path);
+        return dump;
+    }
+    dump << std::setprecision(DUMP_PRECISION);
+    dump << "frame_id,pred_x,pred_y,pred_z\n";
+    spdlog::info("{}: the fused poses of this run are written to '{}'",
+                 driver_name, path);
+    return dump;
 }
 
 } // namespace eval

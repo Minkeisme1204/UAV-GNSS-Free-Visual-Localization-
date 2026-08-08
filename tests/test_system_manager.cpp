@@ -79,9 +79,9 @@
 //      been anchored.
 //
 // Check 7 soft-skips (still PASS) when the gitignored dataset video is absent,
-// the same contract as test_full_flight / test_fusion_offline. The mission
-// config is only READ; every other check builds its YAML in memory. Nothing
-// under config/ is created or modified.
+// the same contract as test_full_flight. The mission config is only READ; every
+// other check builds its YAML in memory. Nothing under config/ is created or
+// modified.
 //
 // Headless; exits non-zero on failure.
 

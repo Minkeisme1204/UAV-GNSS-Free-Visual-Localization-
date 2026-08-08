@@ -5,6 +5,8 @@
 #include <uavloc/debug_viewer/viewer_metrics.h>
 #include <Eigen/Core>
 #include <Eigen/Geometry>
+#include <yaml-cpp/yaml.h>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -17,6 +19,9 @@
 // shared_ptr signatures, so an incomplete type is sufficient here.
 namespace cv { class Mat; }
 namespace spdlog { namespace sinks { class sink; } }
+// attach() takes it by reference only — a forward declaration keeps the whole
+// pipeline out of every translation unit that draws a window.
+namespace uavloc::core { class SystemManager; }
 
 namespace uavloc::debug_viewer {
 
@@ -52,17 +57,36 @@ struct AnchorFixMarker {
     bool            from_reinit = false;
 };
 
+//! Running totals of the absolute-fix markers the viewer draws, as its own
+//! bookkeeping sees them: how many measurements the producer generated and how
+//! the back-end judged them. Exposed because a driver has to REPORT those
+//! numbers (.claude/rules/reporting.md) and the bookkeeping now lives here.
+struct AnchorFixCounters {
+    std::size_t generated        = 0;
+    std::size_t accepted         = 0;
+    std::size_t rejected         = 0;
+    std::size_t pending          = 0;  //!< emitted, verdict not known yet
+    std::size_t reinit_generated = 0;
+    std::size_t reinit_accepted  = 0;
+};
+
 class DebugViewer {
 public:
     //! State of the run-control button drawn on the main panel. The viewer
-    //! knows nothing about what is being run — it only tracks which of the two
-    //! labels to draw ("Start" when IDLE or PAUSED, "Stop" when RUNNING) and
-    //! reports the click.
+    //! knows nothing about what is being run — it only tracks which label to
+    //! draw ("Start" when IDLE or PAUSED, "Stop" when RUNNING, a DISABLED
+    //! "Finished" when FINISHED) and reports the click.
     //!
     //! IDLE and PAUSED are distinct because the DRIVER usually has to do
     //! different work for the first Start (bring the whole pipeline up) and for
     //! a later one (resume a paused input); the button looks the same in both.
-    enum class RunState { IDLE, RUNNING, PAUSED };
+    //!
+    //! FINISHED is the TERMINAL state: the pipeline has been shut down for
+    //! good, so no click could ever be honoured again. It exists because a
+    //! button that says "Start" and then silently refuses is a display telling
+    //! a lie — the state where the run is over is visually different from the
+    //! state where it is merely paused.
+    enum class RunState { IDLE, RUNNING, PAUSED, FINISHED };
 
     //! Handler invoked (on the render thread) when the user clicks the
     //! run-control button. `want_run` is true for Start (run / resume), false
@@ -76,6 +100,18 @@ public:
     //! subscribers with no return path, so it cannot carry the verdict, and
     //! "N owners of one pipeline" is not a meaningful configuration.
     using RunControlHandler = std::function<bool(bool want_run)>;
+
+    //! Observer of every FUSED DISPLAY POSE the bridge hands to
+    //! pushFusedPose(), in push order, with the frame it belongs to and the
+    //! position already mapped into the groundtruth ENU frame.
+    //!
+    //! It exists so a TEST can record that sequence (tests/test_vo_viewer.cpp's
+    //! UAVLOC_VIEWER_DUMP regression gate) without the recording itself
+    //! becoming a viewer feature: writing a CSV is an artifact of the
+    //! experiment, not of the display. Invoked on whichever thread produced the
+    //! pose (the fusion thread in async mode), so the sink must be thread-safe.
+    using FusedPoseSink =
+        std::function<void(unsigned int frame_id, const Eigen::Vector3d& enu_display)>;
 
     struct Config {
         std::string window_title        = "UAV Debug Viewer";
@@ -197,11 +233,94 @@ public:
         // the back-end accepted the measurement, purple where it rejected it or
         // has not judged it yet. Toggled live by the "Anchor fixes" checkbox.
         bool        show_anchor_fixes   = true;
+
+        // ── Overlay-driver parameters ───────────────────────────────────────
+        // These do not configure the window; they configure the DRIVER-side
+        // bridge that feeds it (TrajectoryAligner, the HUD heading, and the
+        // performance sampler). They live here so one YAML section describes
+        // the whole overlay instead of half of it.
+        //
+        // Number of initial TRACKING frames accumulated before the VO-world ->
+        // groundtruth-ENU rigid transform is frozen. Clamped to >= 1.
+        int         alignment_window_frames = 50;
+        // Optional freeze gate: when > 0, delay freezing the alignment until the
+        // groundtruth window spans at least this many metres horizontally
+        // (guards the yaw estimate against a near-stationary window).
+        // 0 = off (freeze as soon as the window is full).
+        double      alignment_min_spread_m  = 0.0;
+        // Minimum per-frame baseline (metres) before the course-over-ground
+        // heading shown on the HUD is refreshed (anti-jitter when hovering).
+        double      hud_min_baseline_m      = 0.5;
+        // Period (ms) of the /proc CPU%/RSS performance sampler thread that
+        // feeds pushPerf(). Clamped to >= 50.
+        int         perf_sample_ms          = 500;
+
+        // ── Run policy supplied by the APPLICATION (never read from YAML) ────
+        // These three are decisions only the application can make; the viewer
+        // merely executes them. They are deliberately absent from fromYaml():
+        // a config file must not be able to auto-start a pipeline or silently
+        // cap a measurement run.
+        //
+        // Start the attached SystemManager as soon as run() begins instead of
+        // waiting for the user to press "Start". Every situation in which
+        // nobody CAN press the button (headless, a deterministic dump gate, an
+        // explicit override) must set this, or the run would hang forever.
+        bool        autostart               = false;
+        // Human-readable justification for `autostart`, logged verbatim next to
+        // the decision so a log reader can tell WHY a run started by itself.
+        std::string autostart_reason;
+        // Hard cap on processed frames; 0 = run until end of stream. The
+        // supervisor stops the system as soon as it sees the count, and the
+        // bridge additionally ignores every output past the cap-th frame so the
+        // cap is exact on the OUTPUT side too (a late fusion result is judged by
+        // the frame it belongs to, not by when it landed).
+        std::size_t max_frames              = 0;
+
+        //! Read a Config from the mission YAML's "DebugViewer:" sub-tree.
+        //! Follows the project pattern node["key"].as<T>(default), so missing
+        //! keys never throw and an absent/!node section yields the defaults.
+        static Config fromYaml(const YAML::Node& node);
     };
 
     DebugViewer();
     explicit DebugViewer(const Config& cfg);
     ~DebugViewer();
+
+    // ── Bridge to the pipeline (S3/S4) ───────────────────────────────────────
+    //! Subscribe to `sys`'s four display channels (on_frame_processed /
+    //! on_vo_data / on_fusion_result / on_lag_window), install the Start/Stop
+    //! run control, and remember `sys` so run() can supervise it. The reference
+    //! must outlive this viewer.
+    //!
+    //! From here on run() also owns the run: it auto-starts the system when
+    //! Config::autostart is set, spawns the end-of-data supervisor and the
+    //! performance sampler, and joins both before it returns.
+    //!
+    //! Call before run(). Attaching twice is refused (logged) — two bridges
+    //! would double every trajectory.
+    void attach(core::SystemManager& sys);
+    //! Install the fused-pose observer (see FusedPoseSink). Pass an empty
+    //! function to remove it. Call before start/run; there is exactly one sink.
+    void setFusedPoseSink(FusedPoseSink sink);
+    //! Record one ABSOLUTE-POSITION measurement the producer just generated.
+    //! `xy_fusion_enu` is in the back-end's own ENU frame (the frame of
+    //! fusion::FusionResult::T_enu_c); the viewer supplies the missing altitude
+    //! from the newest fused pose and applies the same display anchoring as the
+    //! fused line. The accepted/rejected verdict is NOT given here — it is
+    //! polled from the back-end later. Thread-safe.
+    //! Only drawn once enableAnchorFixTracking() has been called.
+    void pushAnchorFix(const Eigen::Vector2d& xy_fusion_enu, bool from_reinit);
+    //! Turn on absolute-fix marker drawing and the verdict polling, with a
+    //! PERMANENT warning line the producer must supply. The warning is not
+    //! decoration: when the "measurements" are manufactured (the M1 fake
+    //! anchor derives them from groundtruth), a screenshot of this window must
+    //! not be able to travel without that caveat
+    //! (.claude/rules/reporting.md). Pass an empty string only when the fixes
+    //! really are independent measurements.
+    void enableAnchorFixTracking(const std::string& contamination_warning);
+    //! Snapshot of the marker bookkeeping (thread-safe). All zeros when
+    //! enableAnchorFixTracking() was never called.
+    AnchorFixCounters anchorFixCounters() const;
 
     // Pre-load a batch of records before run() is called (not thread-safe vs run())
     void loadBatch(const std::vector<TelemetryRecord>& records);
@@ -289,9 +408,9 @@ public:
     void setRunControl(RunControlHandler handler);
     // Set the button state from the producer side, for the transitions the user
     // did not cause: an auto-started run (headless / dump / autostart env) is
-    // RUNNING from the outset, and a run whose data ended by itself goes back to
-    // showing "Start" (whether that click can still do anything is the
-    // handler's verdict, not the viewer's business). Thread-safe.
+    // RUNNING from the outset, and a run whose data ended and whose pipeline
+    // was shut down is FINISHED — the button then goes grey and stops inviting
+    // a click that could only be refused. Thread-safe.
     void setRunState(RunState state);
     // Current button state. Thread-safe.
     RunState runState() const;
@@ -299,7 +418,11 @@ public:
     // scrolling terminal panel. Attach it to the default logger's sink list
     // before logging. Lazily created; the same instance is returned thereafter.
     std::shared_ptr<spdlog::sinks::sink> logSink();
-    // Blocking render loop — registers listeners on DebugViewerCallbacks
+    // Blocking render loop — registers listeners on DebugViewerCallbacks.
+    // With a system attached (see attach()) it additionally owns the RUN: it
+    // performs the configured auto-start, spawns the supervisor and the
+    // performance sampler, and joins both before returning — on the headless
+    // path (where it does not block on a window) just as much as on the GUI one.
     void run();
     // Request shutdown from any thread
     void stop();

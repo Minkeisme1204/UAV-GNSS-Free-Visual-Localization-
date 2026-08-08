@@ -14,25 +14,36 @@
 //   both on the SAME config, the SAME frame cap and the same (empty) flags;
 //   3. joins the two on frame_id and compares.
 //
-// ⚠ The comparison is NOT absolute. The viewer dumps the pose AFTER its display
-// anchoring g0 + (p - f0), i.e. the whole line is shifted by a constant vector
-// (g0 - f0) that test_full_flight does not apply. The property under test is
-// therefore: the per-frame difference is CONSTANT. The test measures the spread
-// of that difference (max - min per axis) and fails when it exceeds
-// MAX_SPREAD_M. A test comparing the raw values would fail on a correct system;
-// one comparing only the mean would pass on a broken one.
+// ⚠ The comparison is NOT absolute. With the viewer compiled in, test_vo_viewer
+// dumps the pose AFTER its display anchoring g0 + (p - f0), i.e. the whole line
+// is shifted by a constant vector (g0 - f0) that test_full_flight does not
+// apply; with ENABLE_VIEWER=OFF it dumps the raw fused ENU position and the
+// shift is zero. The property under test is therefore: the per-frame difference
+// is CONSTANT. The test measures the spread of that difference (max - min per
+// axis) and fails when it exceeds MAX_SPREAD_M. A test comparing the raw values
+// would fail on a correct system; one comparing only the mean would pass on a
+// broken one. The mean is REPORTED, never asserted — its value is a legitimate
+// property of the build configuration and of the data.
 //
 // The viewer is spawned with DISPLAY and WAYLAND_DISPLAY CLEARED: with a
 // display it opens a live window and blocks until the user closes it.
+//
+// ⚠ The frame cap and the viewer's dump path are NOT passed to test_vo_viewer:
+// that driver takes no environment variable at all any more. Both sides read
+// the SAME named constants from tests/driver_common.h (eval::PARITY_MAX_FRAMES,
+// eval::VIEWER_DUMP_PATH), which is what keeps the two runs on the same data.
+// test_full_flight is still steered from here (it is not part of that change).
 //
 // Soft-skip: when the mission config's (gitignored) video is absent both
 // drivers exit 0 without producing data, and so does this test — but only
 // because the video was checked for FIRST. An empty CSV with the video present
 // is a failure, not a skip.
 //
-// Usage:  ./tests/test_driver_parity [config.yaml] [max_frames]
+// Usage:  ./tests/test_driver_parity [config.yaml]
 
 #include "uavloc/sensor/video_reader.h"
+
+#include "driver_common.h"
 
 #include <spdlog/spdlog.h>
 #include <yaml-cpp/yaml.h>
@@ -56,11 +67,6 @@
 #endif
 
 namespace {
-
-//! Frames fed to both drivers. Small enough to keep the gate cheap, large
-//! enough that VO has initialised, lost tracking and re-initialised at least
-//! once on ds3 — i.e. the paths where the two drivers could actually diverge.
-constexpr int DEFAULT_MAX_FRAMES = 200;
 
 //! Maximum spread (max - min over the common frames, per axis) of the constant
 //! offset between the two pose sequences, in metres. The two drivers run the
@@ -163,7 +169,9 @@ int run(const std::string& cmd) {
 int main(int argc, char** argv) {
     const std::string config_path =
         (argc > 1) ? argv[1] : std::string(UAVLOC_PARITY_CONFIG_PATH);
-    const int max_frames = (argc > 2) ? std::atoi(argv[2]) : DEFAULT_MAX_FRAMES;
+    // NOT overridable: test_vo_viewer's cap is compiled in, so a cap chosen
+    // here could only make the two drivers read different amounts of data.
+    const int max_frames = uavloc::eval::PARITY_MAX_FRAMES;
     const std::string ff_exe(UAVLOC_FULL_FLIGHT_EXE);
     const std::string vw_exe(UAVLOC_VO_VIEWER_EXE);
 
@@ -203,20 +211,21 @@ int main(int argc, char** argv) {
     }
 
     const std::string ff_csv  = "driver_parity_full_flight.csv";
-    const std::string vw_csv  = "driver_parity_viewer.csv";
+    // Written by test_vo_viewer itself, at its own compiled-in path.
+    const std::string vw_csv  = uavloc::eval::VIEWER_DUMP_PATH;
     const std::string ff_log  = "driver_parity_full_flight.log";
     const std::string vw_log  = "driver_parity_viewer.log";
     const std::string frames  = std::to_string(max_frames);
 
-    // Both drivers get the SAME cap and the SAME (empty) experiment flags. The
+    // Both drivers read the SAME number of frames: test_full_flight is told so
+    // on its command line, the viewer has the same constant compiled in. The
     // viewer additionally gets DISPLAY/WAYLAND_DISPLAY cleared — with a display
     // it blocks on a live window until the user closes it.
     const std::string ff_cmd =
         "UAVLOC_VO_MAXFRAMES=" + frames + " " +
         ff_exe + " " + config_path + " " + ff_csv + " > " + ff_log + " 2>&1";
     const std::string vw_cmd =
-        "env -u DISPLAY -u WAYLAND_DISPLAY UAVLOC_VO_MAXFRAMES=" + frames +
-        " UAVLOC_VIEWER_DUMP=" + vw_csv + " " +
+        "env -u DISPLAY -u WAYLAND_DISPLAY " +
         vw_exe + " " + config_path + " > " + vw_log + " 2>&1";
 
     if (run(ff_cmd) != 0) {

@@ -4,6 +4,7 @@
 #include <uavloc/debug_viewer/telemetry_csv_reader.h>
 
 #include "barcode_decoder.h"
+#include "debug_viewer_bridge.h"
 #include "gps_to_enu.h"
 #include "log_ring_sink.h"
 
@@ -100,9 +101,17 @@ constexpr float FIX_REINIT_MARKER_POINT_SCALE = 16.0f;
 // Colour of the permanent contamination banner (setAnchorOverlay).
 constexpr float WARNING_TEXT_COLOR[4] = {1.00f, 0.25f, 0.25f, 1.0f};
 
-// Run-control button (setRunControl): the two labels it alternates between.
-constexpr const char* RUN_BUTTON_START = "Start";
-constexpr const char* RUN_BUTTON_STOP  = "Stop";
+// Run-control button (setRunControl): the labels it alternates between, plus
+// the terminal one. RUN_BUTTON_FINISHED is drawn DISABLED — once the pipeline
+// has been shut down for good, offering "Start" would be a lie the user only
+// finds out about by clicking it.
+constexpr const char* RUN_BUTTON_START    = "Start";
+constexpr const char* RUN_BUTTON_STOP     = "Stop";
+constexpr const char* RUN_BUTTON_FINISHED = "Finished";
+// Explanation drawn next to the disabled button, so the grey widget is not a
+// mystery: the run is over and only closing the window is left.
+constexpr const char* RUN_FINISHED_HINT =
+    "run over - close the window to exit";
 
 // Draw one auto-follow streaming line chart of `values` vs `xs`.
 //
@@ -654,6 +663,12 @@ struct DebugViewer::Impl {
 
     BarcodeDecoder decoder;
 
+    // Bridge to a core::SystemManager (attach()): the four channel handlers,
+    // the display anchoring, and the two threads that own the run. Null until
+    // attach() is called — a bare viewer (demo_debug_viewer, TrajectoryViewer
+    // users) never allocates one.
+    std::unique_ptr<SystemBridge> bridge;
+
     // ---- helpers -----------------------------------------------------------
 
     Eigen::Vector3f toEnu(const TelemetryRecord& r) {
@@ -828,6 +843,48 @@ void DebugViewer::setAnchorOverlay(const std::string& warning,
     impl_->banner_stats_   = stats;
 }
 
+// ---------------------------------------------------------------------------
+// Bridge to the pipeline — thin delegation; the logic lives in SystemBridge
+// (src/debug_viewer/debug_viewer_bridge.{h,cpp}). It sits here only because
+// SystemBridge is owned by the pimpl, which is private to this TU.
+// ---------------------------------------------------------------------------
+void DebugViewer::attach(core::SystemManager& sys) {
+    if (!impl_->bridge) {
+        impl_->bridge = std::make_unique<SystemBridge>(*this, impl_->cfg);
+    }
+    impl_->bridge->attach(sys);
+}
+
+void DebugViewer::setFusedPoseSink(FusedPoseSink sink) {
+    if (!impl_->bridge) {
+        impl_->bridge = std::make_unique<SystemBridge>(*this, impl_->cfg);
+    }
+    impl_->bridge->setFusedPoseSink(std::move(sink));
+}
+
+void DebugViewer::pushAnchorFix(const Eigen::Vector2d& xy_fusion_enu,
+                                bool from_reinit) {
+    if (!impl_->bridge) {
+        spdlog::warn("DebugViewer::pushAnchorFix: no system attached — fix dropped");
+        return;
+    }
+    impl_->bridge->pushAnchorFix(xy_fusion_enu, from_reinit);
+}
+
+void DebugViewer::enableAnchorFixTracking(const std::string& contamination_warning) {
+    if (!impl_->bridge) {
+        impl_->bridge = std::make_unique<SystemBridge>(*this, impl_->cfg);
+    }
+    impl_->bridge->enableAnchorFixTracking(contamination_warning);
+}
+
+AnchorFixCounters DebugViewer::anchorFixCounters() const {
+    if (!impl_->bridge) {
+        return AnchorFixCounters{};
+    }
+    return impl_->bridge->anchorFixCounters();
+}
+
 void DebugViewer::setRunControl(RunControlHandler handler) {
     const bool has = static_cast<bool>(handler);
     {
@@ -944,6 +1001,15 @@ void DebugViewer::run() {
     impl_->show_fused_       = impl_->cfg.show_fused;
     impl_->show_anchor_fixes_ = impl_->cfg.show_anchor_fixes;
 
+    // --- Own the run: auto-start + supervisor + perf sampler (S4). ----------
+    // Deliberately BEFORE the GL init, which is where the driver used to do it:
+    // the pipeline must come up at the same point in the sequence as before.
+    // A refused auto-start spawned no thread, so there is nothing to join and
+    // returning here cannot hang.
+    if (impl_->bridge && !impl_->bridge->begin()) {
+        return;
+    }
+
     // --- Decide whether a GL window can be opened. -------------------------
     guik::LightViewer* viewer = nullptr;
     // Treat an unset OR empty DISPLAY/WAYLAND_DISPLAY as headless. `DISPLAY=`
@@ -984,8 +1050,20 @@ void DebugViewer::run() {
             // detach a figure from its caveat, and it is the one widget the user
             // looks for first. Drawn only when a driver installed a handler.
             if (impl_->run_control_set_.load()) {
-                const bool running = (impl_->run_state_.load() == RunState::RUNNING);
-                if (ImGui::Button(running ? RUN_BUTTON_STOP : RUN_BUTTON_START)) {
+                const RunState state = impl_->run_state_.load();
+                const bool running  = (state == RunState::RUNNING);
+                const bool finished = (state == RunState::FINISHED);
+                // Terminal state: the pipeline is down for good, so the widget
+                // must not invite a click. Grey it out and say why, instead of
+                // showing "Start" and refusing in the log where nobody looks.
+                if (finished) {
+                    ImGui::BeginDisabled(true);
+                    ImGui::Button(RUN_BUTTON_FINISHED);
+                    ImGui::EndDisabled();
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("%s", RUN_FINISHED_HINT);
+                } else if (ImGui::Button(running ? RUN_BUTTON_STOP
+                                                 : RUN_BUTTON_START)) {
                     const bool want_run = !running;
                     RunControlHandler handler;
                     {
@@ -1773,6 +1851,11 @@ void DebugViewer::run() {
                 std::chrono::milliseconds(VIEWER_SPIN_SLEEP_MS));
         }
         guik::LightViewer::destroy();
+        // Both service threads are joined BEFORE run() returns, on this
+        // headless-capable branch as much as on the GUI one.
+        if (impl_->bridge) {
+            impl_->bridge->end(impl_->had_display.load());
+        }
         spdlog::info("DebugViewer: push/pre-loaded run finished");
         return;
     }
@@ -1783,6 +1866,9 @@ void DebugViewer::run() {
     if (!cap.isOpened()) {
         spdlog::error("DebugViewer::run: cannot open video: {}", impl_->video_path);
         guik::LightViewer::destroy();
+        if (impl_->bridge) {
+            impl_->bridge->end(impl_->had_display.load());
+        }
         return;
     }
     spdlog::info("DebugViewer: streaming video {} ({}x{}, {} frames)",
@@ -1859,6 +1945,9 @@ void DebugViewer::run() {
     }
 
     guik::LightViewer::destroy();
+    if (impl_->bridge) {
+        impl_->bridge->end(impl_->had_display.load());
+    }
 }
 
 } // namespace uavloc::debug_viewer

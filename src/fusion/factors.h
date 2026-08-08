@@ -5,7 +5,8 @@
 // must not leak into the public uavloc API.
 //
 // Formulations follow .docs/theory/heading_agl_prior_tactics.md §5.3/§6 and
-// the kcb_slam ScaledVOFactor precedent (kcb docs/05_khoi_fusion.md §3.1):
+// the kcb_slam ScaledVOFactor precedent
+// (.docs/related_work/kcb_slam/05_khoi_fusion.md §3.1):
 // pure error functions + gtsam::numericalDerivative Jacobians.
 
 #include <gtsam/base/numericalDerivative.h>

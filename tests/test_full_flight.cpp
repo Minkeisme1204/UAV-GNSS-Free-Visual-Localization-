@@ -121,8 +121,9 @@
 //                                   main CSV is the bit-identical gate and must
 //                                   keep its exact column set.
 //
-// Mirrors tests/test_fusion_offline.cpp (soft-skip when the gitignored
-// dataset video is absent; same lost/reinit accounting). Headless, no viewer.
+// Driver contract: soft-skip (still PASS) when the gitignored dataset video is
+// absent, and account lost/reinit events from the VO state transitions.
+// Headless, no viewer.
 
 #include "uavloc/sensor/stream_types.h"
 #include "uavloc/sensor/video_reader.h"
@@ -155,9 +156,12 @@
 #include <string>
 #include <vector>
 
+#ifndef UAVLOC_MISSION_CONFIG_PATH
+#define UAVLOC_MISSION_CONFIG_PATH "config/uavloc_yenbai500m.yaml"   // fallback; CMake injects the real path
+#endif
+
 namespace {
-const std::string DEFAULT_CONFIG_PATH =
-    "/home/minkeisrtx5090/Desktop/Workplace/HUST/uav_localization/config/uavloc_yenbai500m.yaml";
+const std::string DEFAULT_CONFIG_PATH = UAVLOC_MISSION_CONFIG_PATH;
 const std::string DEFAULT_OUTPUT_CSV = "full_flight.csv";
 
 constexpr int CSV_PRECISION = 12;
@@ -467,7 +471,7 @@ int main(int argc, char** argv) {
     // loop: the fake anchor has to be attached BEFORE setup(), and its
     // generation callback writes into the per-fix accounting declared below.
 
-    // Run statistics (same lost/reinit accounting as test_fusion_offline).
+    // Run statistics; lost/reinit are counted from the VO state transitions.
     int    frames_fed        = 0;
     int    tracking_frames   = 0;
     int    keyframe_count    = 0;

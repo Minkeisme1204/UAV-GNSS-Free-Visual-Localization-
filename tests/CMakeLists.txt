@@ -17,21 +17,38 @@ target_link_libraries(uavloc_test_eval PUBLIC uavloc)
 target_include_directories(uavloc_test_eval PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
 # ── sensor ────────────────────────────────────────────────────────────────────
+# Reads a mission config (path from CMake, argv[1] overrides) and soft-skips when
+# its gitignored video is absent. UAVLOC_VR_SHOW=0 keeps ctest headless even on a
+# machine with a display — without it the GUI path blocks until the window closes.
 add_executable(test_video_reader test_video_reader.cpp)
 target_link_libraries(test_video_reader PRIVATE uavloc)
+target_compile_definitions(test_video_reader PRIVATE
+    UAVLOC_MISSION_CONFIG_PATH="${CMAKE_SOURCE_DIR}/config/uavloc_yenbai800m_newvo.yaml"
+)
 set_target_properties(test_video_reader PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${TEST_OUTPUT_DIR}
 )
 add_test(NAME test_video_reader COMMAND test_video_reader)
+set_tests_properties(test_video_reader PROPERTIES
+    ENVIRONMENT "UAVLOC_VR_SHOW=0"
+    TIMEOUT 120
+)
 
 # ── drone-log telemetry parser ────────────────────────────────────────────────
+# Takes its DroneTelemetry node straight out of the mission config (path from
+# CMake, argv[1] overrides; argv[2] overrides just the csv_path), so no dataset
+# path is written in the test source. Soft-skips when the CSV is absent.
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_drone_telemetry.cpp)
     add_executable(test_drone_telemetry test_drone_telemetry.cpp)
     target_link_libraries(test_drone_telemetry PRIVATE uavloc)
+    target_compile_definitions(test_drone_telemetry PRIVATE
+        UAVLOC_MISSION_CONFIG_PATH="${CMAKE_SOURCE_DIR}/config/uavloc_yenbai800m_newvo.yaml"
+    )
     set_target_properties(test_drone_telemetry PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${TEST_OUTPUT_DIR}
     )
     add_test(NAME test_drone_telemetry COMMAND test_drone_telemetry)
+    set_tests_properties(test_drone_telemetry PROPERTIES TIMEOUT 120)
 endif()
 
 # ── push-style data source (S6a: DataSourceInterface + VideoDataSource) ─────
@@ -132,6 +149,9 @@ endif()
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_vo_frame_loader.cpp)
     add_executable(test_vo_frame_loader test_vo_frame_loader.cpp)
     target_link_libraries(test_vo_frame_loader PRIVATE uavloc)
+    target_compile_definitions(test_vo_frame_loader PRIVATE
+        UAVLOC_MISSION_CONFIG_PATH="${CMAKE_SOURCE_DIR}/config/uavloc_yenbai800m_newvo.yaml"
+    )
     set_target_properties(test_vo_frame_loader PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${TEST_OUTPUT_DIR}
     )
@@ -142,118 +162,47 @@ endif()
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_vo_pipeline_new.cpp)
     add_executable(test_vo_pipeline_new test_vo_pipeline_new.cpp)
     target_link_libraries(test_vo_pipeline_new PRIVATE uavloc)
+    target_compile_definitions(test_vo_pipeline_new PRIVATE
+        UAVLOC_MISSION_CONFIG_PATH="${CMAKE_SOURCE_DIR}/config/uavloc_yenbai800m_newvo.yaml"
+    )
     set_target_properties(test_vo_pipeline_new PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${TEST_OUTPUT_DIR}
     )
     add_test(NAME test_vo_pipeline_new COMMAND test_vo_pipeline_new)
 endif()
 
-# ── new_vo debug driver (VOData publish callback + top-down trajectory) ───────
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_vo_debug_new.cpp)
-    add_executable(test_vo_debug_new test_vo_debug_new.cpp)
-    target_link_libraries(test_vo_debug_new PRIVATE uavloc)
-    set_target_properties(test_vo_debug_new PROPERTIES
+# ── viewer alignment maths (debug_viewer::TrajectoryAligner) ────────────────
+# Pure synthetic unit test: no dataset, no GL. TrajectoryAligner only exists in
+# libuavloc when the viewer module is compiled in, so the test is gated on the
+# same condition as the module — with ENABLE_VIEWER=OFF it is not built.
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_viewer_align.cpp
+   AND ENABLE_VIEWER AND Iridescence_FOUND)
+    add_executable(test_viewer_align test_viewer_align.cpp)
+    target_link_libraries(test_viewer_align PRIVATE uavloc)
+    set_target_properties(test_viewer_align PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${TEST_OUTPUT_DIR}
     )
-    # Optional live 3D viewer (trajectory + map-point cloud). Only when
-    # Iridescence and the debug_viewer library are available. Linking both uavloc
-    # and uavloc_debug_viewer in one exe is valid — they are independent units.
-    if(Iridescence_FOUND AND TARGET uavloc_debug_viewer)
-        target_link_libraries(test_vo_debug_new PRIVATE uavloc_debug_viewer)
-        target_compile_definitions(test_vo_debug_new PRIVATE UAVLOC_WITH_DEBUG_VIEWER)
-        # gps_to_enu.h lives in src/debug_viewer (header-only helper).
-        target_include_directories(test_vo_debug_new PRIVATE ${CMAKE_SOURCE_DIR}/src/debug_viewer)
-        target_link_options(test_vo_debug_new PRIVATE "-Wl,--disable-new-dtags")
-        set_target_properties(test_vo_debug_new PROPERTIES
-            BUILD_RPATH   "${CMAKE_SOURCE_DIR}/.local/lib"
-            INSTALL_RPATH "${CMAKE_SOURCE_DIR}/.local/lib"
-        )
-    endif()
-    add_test(NAME test_vo_debug_new COMMAND test_vo_debug_new)
+    add_test(NAME test_viewer_align COMMAND test_viewer_align)
+    set_tests_properties(test_viewer_align PROPERTIES TIMEOUT 60)
 endif()
 
-# ── new_vo LIVE 3D viewer driver (trajectory + groundtruth + map cloud) ───────
-# Manual/demo tool: the VO pipeline runs on a worker thread while DebugViewer::run()
-# owns the main thread (live window). Not registered as a blocking ctest that runs
-# to END_OF_STREAM; a headless capped smoke (UAVLOC_VO_MAXFRAMES) is added instead.
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_vo_viewer.cpp)
-    add_executable(test_vo_viewer test_vo_viewer.cpp)
-    # uavloc_test_eval carries driver_common.{h,cpp}: the forced run mode and the
-    # fake-anchor configuration this driver must share with test_full_flight.
-    target_link_libraries(test_vo_viewer PRIVATE uavloc uavloc_test_eval)
-    set_target_properties(test_vo_viewer PROPERTIES
+# ── viewer RUN POLICY (eval::viewer_run_policy) ─────────────────────────────
+# Pure unit test of the predicate that decides "regression run or interactive
+# session?" — it manipulates DISPLAY/WAYLAND_DISPLAY in-process and asserts the
+# autostart + frame-cap PAIR. NOT gated on ENABLE_VIEWER: the predicate lives in
+# uavloc_test_eval (driver_common.cpp), which is built in both configurations,
+# and the GUI branch it decides can never be exercised on a headless machine —
+# checking the decision is the only coverage available.
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_viewer_run_policy.cpp)
+    add_executable(test_viewer_run_policy test_viewer_run_policy.cpp)
+    target_link_libraries(test_viewer_run_policy PRIVATE uavloc uavloc_test_eval)
+    set_target_properties(test_viewer_run_policy PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${TEST_OUTPUT_DIR}
     )
-    # Optional live 3D viewer. Only when Iridescence and the debug_viewer library
-    # are available. Linking both uavloc and uavloc_debug_viewer in one exe is
-    # valid — they are independent code units.
-    if(Iridescence_FOUND AND TARGET uavloc_debug_viewer)
-        target_link_libraries(test_vo_viewer PRIVATE uavloc_debug_viewer)
-        target_compile_definitions(test_vo_viewer PRIVATE UAVLOC_WITH_DEBUG_VIEWER)
-        # gps_to_enu.h lives in src/debug_viewer (header-only helper).
-        target_include_directories(test_vo_viewer PRIVATE ${CMAKE_SOURCE_DIR}/src/debug_viewer)
-        target_link_options(test_vo_viewer PRIVATE "-Wl,--disable-new-dtags")
-        set_target_properties(test_vo_viewer PROPERTIES
-            BUILD_RPATH   "${CMAKE_SOURCE_DIR}/.local/lib"
-            INSTALL_RPATH "${CMAKE_SOURCE_DIR}/.local/lib"
-        )
-    endif()
-    # Headless capped smoke only — never a blocking run-to-END_OF_STREAM ctest.
-    add_test(NAME test_vo_viewer COMMAND test_vo_viewer)
-    set_tests_properties(test_vo_viewer PROPERTIES
-        ENVIRONMENT "UAVLOC_VO_MAXFRAMES=200"
-        TIMEOUT 120
-    )
+    add_test(NAME test_viewer_run_policy COMMAND test_viewer_run_policy)
+    # No dataset, no threads: seconds at most. The timeout is the safety net.
+    set_tests_properties(test_viewer_run_policy PROPERTIES TIMEOUT 60)
 endif()
-
-# The old vo module (include/uavloc/vo) was removed from the working tree; the
-# three tests below depend on its public headers, so they are guarded and skip
-# while it is absent. They auto-return if the vo headers are restored.
-if(EXISTS ${CMAKE_SOURCE_DIR}/include/uavloc/vo/vo_module.h)
-
-# ── adjacent matching ─────────────────────────────────────────────────────────
-add_executable(test_adjacent_matching test_adjacent_matching.cpp)
-target_link_libraries(test_adjacent_matching PRIVATE uavloc)
-set_target_properties(test_adjacent_matching PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY ${TEST_OUTPUT_DIR}
-)
-add_test(NAME test_adjacent_matching COMMAND test_adjacent_matching)
-
-# ── vo pipeline trajectory ────────────────────────────────────────────────────
-add_executable(test_vo_pipeline test_vo_pipeline.cpp)
-target_link_libraries(test_vo_pipeline PRIVATE uavloc)
-# Drives the pipeline entirely through the public vo::VOModule — no internal
-# src/vo headers needed anymore.
-set_target_properties(test_vo_pipeline PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY ${TEST_OUTPUT_DIR}
-)
-# Optional debug-viewer overlay (estimate vs groundtruth). Only when Iridescence
-# and the debug_viewer library are available. Linking both uavloc and
-# uavloc_debug_viewer in one exe is valid — they are independent code units.
-if(Iridescence_FOUND AND TARGET uavloc_debug_viewer)
-    target_link_libraries(test_vo_pipeline PRIVATE uavloc_debug_viewer)
-    target_compile_definitions(test_vo_pipeline PRIVATE UAVLOC_WITH_DEBUG_VIEWER)
-    # gps_to_enu.h lives in src/debug_viewer (header-only helper).
-    target_include_directories(test_vo_pipeline PRIVATE ${CMAKE_SOURCE_DIR}/src/debug_viewer)
-    target_link_options(test_vo_pipeline PRIVATE "-Wl,--disable-new-dtags")
-    set_target_properties(test_vo_pipeline PROPERTIES
-        BUILD_RPATH   "${CMAKE_SOURCE_DIR}/.local/lib"
-        INSTALL_RPATH "${CMAKE_SOURCE_DIR}/.local/lib"
-    )
-endif()
-add_test(NAME test_vo_pipeline COMMAND test_vo_pipeline)
-
-# ── vo debug (first-N-frames per-frame log) ─────────────────────────────────────
-# Drives the pipeline through the public vo::VOModule and logs a detailed block
-# per frame for the first N valid frames — a compact diagnostic driver.
-add_executable(test_vo_debug test_vo_debug.cpp)
-target_link_libraries(test_vo_debug PRIVATE uavloc)
-set_target_properties(test_vo_debug PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY ${TEST_OUTPUT_DIR}
-)
-add_test(NAME test_vo_debug COMMAND test_vo_debug)
-
-endif()  # old vo module present
 
 # ── anchor (M1: AnchorInterface + the groundtruth-driven FakeAnchor) ─────────
 # Self-contained: the test WRITES its own synthetic groundtruth CSV into the
@@ -294,19 +243,6 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_fusion_factors.cpp)
     add_test(NAME test_fusion_factors COMMAND test_fusion_factors)
 endif()
 
-# ── fusion offline evaluation driver (real pipeline → per-frame CSV) ─────────
-# Runs VideoReader → new_vo VOModule → FusionModule (forced synchronous) on a
-# mission config and dumps a per-frame CSV for offline error analysis. Public
-# API only — links like test_vo_pipeline_new. Not a ctest (needs the dataset
-# video and runs long); invoke manually with UAVLOC_VO_MAXFRAMES.
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_fusion_offline.cpp)
-    add_executable(test_fusion_offline test_fusion_offline.cpp)
-    target_link_libraries(test_fusion_offline PRIVATE uavloc)
-    set_target_properties(test_fusion_offline PROPERTIES
-        RUNTIME_OUTPUT_DIRECTORY ${TEST_OUTPUT_DIR}
-    )
-endif()
-
 # ── full-flight evaluation driver (groundtruth-vs-fused CSV + FPS) ───────────
 # Forces VO async + wait_for_local_bundle_adjustment and fusion sync; logs
 # per-frame groundtruth ENU, fused prediction, tracked landmarks, coordinate
@@ -317,38 +253,106 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_full_flight.cpp)
     add_executable(test_full_flight test_full_flight.cpp)
     target_link_libraries(test_full_flight PRIVATE uavloc uavloc_test_eval)
     target_include_directories(test_full_flight PRIVATE ${CMAKE_SOURCE_DIR}/src/debug_viewer)
+    target_compile_definitions(test_full_flight PRIVATE
+        UAVLOC_MISSION_CONFIG_PATH="${CMAKE_SOURCE_DIR}/config/uavloc_yenbai500m.yaml"
+    )
     set_target_properties(test_full_flight PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${TEST_OUTPUT_DIR}
     )
 endif()
 
-# ── cross-driver parity gate (S9) ────────────────────────────────────────────
-# Spawns test_full_flight and test_vo_viewer on the SAME config/cap and checks
-# that their pose sequences differ by a CONSTANT offset only (the viewer's
-# display anchor). Registered separately from test_vo_viewer's own smoke entry,
-# which is left untouched. DISPLAY/WAYLAND_DISPLAY are cleared in ENVIRONMENT
-# and again in the spawned command line: with a display the viewer opens a live
-# window and blocks until it is closed.
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_driver_parity.cpp
-   AND TARGET test_full_flight AND TARGET test_vo_viewer)
-    add_executable(test_driver_parity test_driver_parity.cpp)
-    target_link_libraries(test_driver_parity PRIVATE uavloc)
-    target_compile_definitions(test_driver_parity PRIVATE
-        UAVLOC_PARITY_CONFIG_PATH="${CMAKE_SOURCE_DIR}/config/uavloc_munfrl_dataset3.yaml"
-        UAVLOC_FULL_FLIGHT_EXE="$<TARGET_FILE:test_full_flight>"
-        UAVLOC_VO_VIEWER_EXE="$<TARGET_FILE:test_vo_viewer>"
-    )
-    add_dependencies(test_driver_parity test_full_flight test_vo_viewer)
-    set_target_properties(test_driver_parity PROPERTIES
-        RUNTIME_OUTPUT_DIRECTORY ${TEST_OUTPUT_DIR}
-    )
-    add_test(NAME test_driver_parity COMMAND test_driver_parity)
-    # Two full 200-frame pipeline runs back to back (~40 s each on the reference
-    # machine); the timeout is the outer safety net, not an expectation.
-    set_tests_properties(test_driver_parity PROPERTIES
-        ENVIRONMENT "DISPLAY=;WAYLAND_DISPLAY="
-        TIMEOUT 900
-    )
+# ── VIEWER-GATED DRIVERS: the two live-view drivers + the parity gate ────────
+# All three are built ONLY when the viewer is compiled in. The two drivers have
+# no headless fallback branch any more (no #ifdef in their sources): a driver
+# whose whole subject is the live view has nothing to do without it.
+#
+# Consequence, accepted deliberately (2026-08-08): test_driver_parity is an
+# ON-ONLY gate. It compares test_full_flight with test_vo_viewer's dump, and
+# that dump no longer exists at OFF. Documented in CLAUDE.md and in
+# `.docs/designs/viewer_module_design.md` §7.
+#
+# Both drivers take NO environment variable: the frame cap and the dump paths
+# are named constants in tests/driver_common.h, which test_driver_parity reads
+# too. That is why nothing but the headless pinning is passed in ENVIRONMENT.
+if(ENABLE_VIEWER AND Iridescence_FOUND)
+    # ── VO + fusion + viewer, NO absolute position ───────────────────────────
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_vo_viewer.cpp)
+        add_executable(test_vo_viewer test_vo_viewer.cpp)
+        # uavloc_test_eval carries driver_common.{h,cpp}: the forced run mode,
+        # the shared assembly helpers and the constants above.
+        target_link_libraries(test_vo_viewer PRIVATE uavloc uavloc_test_eval)
+        target_compile_definitions(test_vo_viewer PRIVATE
+            UAVLOC_MISSION_CONFIG_PATH="${CMAKE_SOURCE_DIR}/config/uavloc_yenbai800m_newvo.yaml"
+        )
+        set_target_properties(test_vo_viewer PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY ${TEST_OUTPUT_DIR}
+        )
+        # Headless capped smoke (the cap is compiled in). DISPLAY must be empty:
+        # with a window the run blocks until the user closes it.
+        add_test(NAME test_vo_viewer COMMAND test_vo_viewer)
+        # RESOURCE_LOCK: the dump path is a compiled-in constant, so this test
+        # and test_driver_parity (which spawns the same binary and then READS
+        # that file) write the very same name. Two writers on one CSV produce a
+        # file that looks fine and compares wrong — ctest must not run them
+        # concurrently.
+        set_tests_properties(test_vo_viewer PROPERTIES
+            ENVIRONMENT "DISPLAY=;WAYLAND_DISPLAY="
+            RESOURCE_LOCK "viewer_pose_dump"
+            TIMEOUT 300
+        )
+    endif()
+
+    # ── the WHOLE flow: VO + fusion + viewer + absolute fixes (fake anchor) ──
+    # ⚠ the fixes are manufactured from groundtruth (M1); the driver prints and
+    # displays that caveat. Replaced by real VPR in Phase 2 without touching the
+    # back-end.
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_vo_vpr_anchor_viewer.cpp)
+        add_executable(test_vo_vpr_anchor_viewer test_vo_vpr_anchor_viewer.cpp)
+        target_link_libraries(test_vo_vpr_anchor_viewer PRIVATE uavloc uavloc_test_eval)
+        target_compile_definitions(test_vo_vpr_anchor_viewer PRIVATE
+            UAVLOC_MISSION_CONFIG_PATH="${CMAKE_SOURCE_DIR}/config/uavloc_yenbai800m_newvo.yaml"
+        )
+        set_target_properties(test_vo_vpr_anchor_viewer PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY ${TEST_OUTPUT_DIR}
+        )
+        add_test(NAME test_vo_vpr_anchor_viewer COMMAND test_vo_vpr_anchor_viewer)
+        set_tests_properties(test_vo_vpr_anchor_viewer PROPERTIES
+            ENVIRONMENT "DISPLAY=;WAYLAND_DISPLAY="
+            TIMEOUT 300
+        )
+    endif()
+
+    # ── cross-driver parity gate (S9) ────────────────────────────────────────
+    # Spawns test_full_flight and test_vo_viewer on the SAME config and cap and
+    # checks that their pose sequences differ by a CONSTANT offset only (the
+    # viewer's display anchor). Registered separately from test_vo_viewer's own
+    # smoke entry. DISPLAY/WAYLAND_DISPLAY are cleared in ENVIRONMENT and again
+    # in the spawned command line: with a display the viewer opens a live window
+    # and blocks until it is closed.
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_driver_parity.cpp
+       AND TARGET test_full_flight AND TARGET test_vo_viewer)
+        add_executable(test_driver_parity test_driver_parity.cpp)
+        # uavloc_test_eval only for driver_common.h's constants (the cap and the
+        # viewer's dump path) — both sides must read the same names.
+        target_link_libraries(test_driver_parity PRIVATE uavloc uavloc_test_eval)
+        target_compile_definitions(test_driver_parity PRIVATE
+            UAVLOC_PARITY_CONFIG_PATH="${CMAKE_SOURCE_DIR}/config/uavloc_munfrl_dataset3.yaml"
+            UAVLOC_FULL_FLIGHT_EXE="$<TARGET_FILE:test_full_flight>"
+            UAVLOC_VO_VIEWER_EXE="$<TARGET_FILE:test_vo_viewer>"
+        )
+        add_dependencies(test_driver_parity test_full_flight test_vo_viewer)
+        set_target_properties(test_driver_parity PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY ${TEST_OUTPUT_DIR}
+        )
+        add_test(NAME test_driver_parity COMMAND test_driver_parity)
+        # Two full 200-frame pipeline runs back to back (~40 s each on the
+        # reference machine); the timeout is the outer safety net.
+        set_tests_properties(test_driver_parity PROPERTIES
+            ENVIRONMENT "DISPLAY=;WAYLAND_DISPLAY="
+            RESOURCE_LOCK "viewer_pose_dump"
+            TIMEOUT 900
+        )
+    endif()
 endif()
 
 # ── MPEG-TS reader: H.264 video + MISB ST 0601 KLV telemetry ─────────────────
@@ -399,41 +403,45 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/vo_demo.cpp)
     )
 endif()
 
-# ── test_iridescence — only needs Iridescence (no debug_viewer target required) ──
-if(Iridescence_FOUND)
-    add_executable(test_iridescence test_iridescence.cpp)
-    target_link_libraries(test_iridescence PRIVATE Iridescence::iridescence Eigen3::Eigen)
-    target_link_options(test_iridescence PRIVATE "-Wl,--disable-new-dtags")
-    set_target_properties(test_iridescence PROPERTIES
-        RUNTIME_OUTPUT_DIRECTORY ${TEST_OUTPUT_DIR}
-        BUILD_RPATH  "${CMAKE_SOURCE_DIR}/.local/lib"
-        INSTALL_RPATH "${CMAKE_SOURCE_DIR}/.local/lib"
-    )
-endif()
-
-# ── demo_debug_viewer — needs both Iridescence and the debug_viewer library ──
-if(Iridescence_FOUND AND TARGET uavloc_debug_viewer)
+# ── viewer demos — deliberately SKIPPED when the viewer is not compiled in ──
+# Both are GUI tools whose whole subject is the viewer, so with
+# ENABLE_VIEWER=OFF (or no Iridescence) they are simply not built.
+if(ENABLE_VIEWER AND Iridescence_FOUND)
     # Guarded: sources are part of an in-progress refactor and may be absent.
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/demo_debug_viewer.cpp)
         add_executable(demo_debug_viewer demo_debug_viewer.cpp)
-        target_link_libraries(demo_debug_viewer PRIVATE uavloc_debug_viewer spdlog::spdlog_header_only)
-        target_link_options(demo_debug_viewer PRIVATE "-Wl,--disable-new-dtags")
+        target_link_libraries(demo_debug_viewer PRIVATE uavloc)
         set_target_properties(demo_debug_viewer PROPERTIES
             RUNTIME_OUTPUT_DIRECTORY ${TEST_OUTPUT_DIR}
-            BUILD_RPATH  "${CMAKE_SOURCE_DIR}/.local/lib"
-            INSTALL_RPATH "${CMAKE_SOURCE_DIR}/.local/lib"
         )
     endif()
 
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/debug_viewer_decode.cpp)
         add_executable(debug_viewer_decode debug_viewer_decode.cpp)
         target_include_directories(debug_viewer_decode PRIVATE ${OpenCV_INCLUDE_DIRS})
-        target_link_libraries(debug_viewer_decode PRIVATE uavloc_debug_viewer ${OpenCV_LIBS} zbar)
-        target_link_options(debug_viewer_decode PRIVATE "-Wl,--disable-new-dtags")
+        target_link_libraries(debug_viewer_decode PRIVATE uavloc zbar)
         set_target_properties(debug_viewer_decode PROPERTIES
             RUNTIME_OUTPUT_DIRECTORY ${TEST_OUTPUT_DIR}
-            BUILD_RPATH  "${CMAKE_SOURCE_DIR}/.local/lib"
-            INSTALL_RPATH "${CMAKE_SOURCE_DIR}/.local/lib"
         )
     endif()
+endif()
+
+# ── build hygiene (S5a) — the invariant that replaced R4 ────────────────────
+# Checks that the viewer stays confined to its module and that ENABLE_VIEWER
+# really changes what lands in libuavloc.so. Pure shell + binutils, headless.
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/build_hygiene.sh)
+    # The effective state, not the raw option: ENABLE_VIEWER=ON without
+    # Iridescence still produces a viewer-free libuavloc.
+    if(ENABLE_VIEWER AND Iridescence_FOUND)
+        set(UAVLOC_VIEWER_STATE ON)
+    else()
+        set(UAVLOC_VIEWER_STATE OFF)
+    endif()
+    add_test(NAME test_build_hygiene
+        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/build_hygiene.sh
+                ${CMAKE_SOURCE_DIR}
+                ${UAVLOC_VIEWER_STATE}
+                $<TARGET_FILE:uavloc>
+    )
+    set_tests_properties(test_build_hygiene PROPERTIES TIMEOUT 120)
 endif()

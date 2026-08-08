@@ -6,7 +6,10 @@ config/*
 .lib/*
 .local/*
 build/*
+# deployment / viewer-off configuration tree (cmake -B build_off -DENABLE_VIEWER=OFF)
+build_off/*
 .repo
 *.zip
 .env
 .venv
+.code-review-graph 
