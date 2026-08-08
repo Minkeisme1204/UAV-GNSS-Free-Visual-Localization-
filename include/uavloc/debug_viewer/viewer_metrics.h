@@ -1,5 +1,8 @@
 #pragma once
 
+#include <string>
+#include <vector>
+
 namespace uavloc::debug_viewer {
 
 // A single per-frame VO metric sample fed to the live line chart. Carries only
@@ -25,6 +28,44 @@ struct PerfSample {
     double t_sec       = 0.0;   // wall-clock seconds since the producer started
     float  cpu_percent = 0.0f;  // process CPU usage; may exceed 100 with threads
     float  rss_mb      = 0.0f;  // resident set size (MB)
+};
+
+// One row of the "Profiling" table: the accumulated timing of one measured
+// computation block. The PRODUCER measures and derives every number (the viewer
+// only formats them), keeping the viewer decoupled from the profiling
+// mechanism. POD only (no GL/ImGui involvement).
+struct ProfileRow {
+    std::string        name;              // module/stage name, e.g. "ORB_EXTRACT"
+    float              mean_ms  = 0.0f;   // total_ms / count — the headline number
+    float              last_ms  = 0.0f;   // most recent sample
+    float              max_ms   = 0.0f;   // largest sample so far
+    unsigned long long count    = 0;      // samples accumulated
+    float              percent  = 0.0f;   // share of the per-frame total (%)
+};
+
+// One live localization-accuracy sample: the distance between the system's
+// PREDICTED position and the GROUNDTRUTH position of the SAME frame, in metres.
+// The PRODUCER pairs the two by frame id and does the subtraction (the viewer
+// owns no notion of "which pose belongs to which frame"), so the viewer only
+// bins and plots. POD only (no GL/ImGui involvement).
+//
+// ⚠ Meaning depends entirely on what the producer calls "groundtruth". When it
+// is telemetry-derived it carries the telemetry's own error; when the same
+// source also feeds an absolute-fix generator the number is CONTAMINATED and
+// must not be reported as system accuracy (.claude/rules/reporting.md).
+struct ErrorSample {
+    int   frame_id = 0;
+    float err_2d_m = 0.0f;   // horizontal distance (E/N plane)
+    float err_3d_m = 0.0f;   // full 3D distance
+};
+
+// A full profiling table snapshot (latest-wins: each push supersedes the
+// previous one). Row order is the producer's order and is preserved by the
+// viewer so the table does not flicker.
+struct ProfileSnapshot {
+    double                  t_sec    = 0.0;  // producer wall-clock seconds
+    int                     frame_id = 0;    // frame the snapshot was taken at
+    std::vector<ProfileRow> rows;
 };
 
 } // namespace uavloc::debug_viewer

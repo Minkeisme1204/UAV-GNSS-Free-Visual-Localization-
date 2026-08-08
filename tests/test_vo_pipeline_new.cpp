@@ -31,9 +31,12 @@
 #include <string>
 #include <vector>
 
+#ifndef UAVLOC_MISSION_CONFIG_PATH
+#define UAVLOC_MISSION_CONFIG_PATH "config/uavloc_yenbai800m_newvo.yaml"   // fallback; CMake injects the real path
+#endif
+
 namespace {
-const std::string DEFAULT_CONFIG_PATH =
-    "/home/minkeisrtx5090/Desktop/Workplace/HUST/uav_localization/config/uavloc_yenbai800m.yaml";
+const std::string DEFAULT_CONFIG_PATH = UAVLOC_MISSION_CONFIG_PATH;
 
 constexpr int MAX_FRAMES = 10000;  // hard cap on frames fed to the pipeline (smoke)
 
@@ -44,7 +47,7 @@ const std::string FULL_OUTPUT_IMAGE_PATH = "vo_full_trajectory.png";
 constexpr int FULL_PROGRESS_EVERY = 500;
 
 // ── Trajectory image presentation constants (rendering only — NOT pipeline
-//    thresholds). Adapted from tests/test_vo_debug_new.cpp. ───────────────────
+//    thresholds). Changing any of them alters the PNG, never the VO result. ───
 const int    CANVAS_SIZE_PX        = 1000;
 const int    CANVAS_MARGIN_PX      = 80;
 const int    POLYLINE_THICKNESS    = 2;
@@ -87,7 +90,9 @@ double nice_round(double value) {
 
 // Project world positions (X horizontal, Y vertical; Z dropped) onto a fitted
 // top-down canvas and write a polyline with start/end markers and a metric scale
-// bar. Mirrors the auto-fit -> toPixel -> imwrite pattern of test_vo_debug_new.
+// bar. The canvas is auto-fitted to the trajectory extent (auto-fit -> to_pixel
+// -> imwrite), so an arbitrarily long flight still fills the image; the scale bar
+// is what keeps the drawing metrically readable after that rescaling.
 bool render_trajectory(const std::vector<Eigen::Vector3d>& positions,
                        const std::string& output_path) {
     if (positions.size() < 2) {

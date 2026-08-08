@@ -4,6 +4,7 @@
 #include <uavloc/debug_viewer/telemetry_csv_reader.h>
 
 #include "barcode_decoder.h"
+#include "debug_viewer_bridge.h"
 #include "gps_to_enu.h"
 #include "log_ring_sink.h"
 
@@ -26,6 +27,7 @@
 #include <atomic>
 #include <cfloat>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdlib>
 #include <deque>
@@ -58,6 +60,10 @@ constexpr int VIEWER_SPIN_SLEEP_MS = 5;
 constexpr int METRIC_PLOT_W = 420;
 constexpr int METRIC_PLOT_H = 360;
 
+// Initial (resizable) size of the "Profiling" table window — first use only.
+constexpr int PROFILE_TABLE_W = 620;
+constexpr int PROFILE_TABLE_H = 420;
+
 // GL resource name for the checkbox-toggled video side panel.
 const char* const VIDEO_PANEL_NAME = "VO video";
 
@@ -76,6 +82,36 @@ constexpr float LOST_MARKER_POINT_SCALE = 8.0f;
 // Colour + screen-space point size for the VO map-point cloud (pushMapPoints).
 constexpr float MAP_POINT_COLOR[4]      = {0.40f, 0.70f, 1.00f, 1.0f}; // light blue
 constexpr float MAP_POINT_SCALE         = 4.0f;
+
+// Absolute-position fix markers (setAnchorFixes). Deliberately the two colours
+// no trajectory uses, and a bigger point than any of them: a fix is a discrete
+// event that must be findable at a glance next to the lines it corrects.
+constexpr float FIX_ACCEPTED_COLOR[4] = {1.00f, 0.90f, 0.10f, 1.0f}; // yellow
+constexpr float FIX_REJECTED_COLOR[4] = {0.65f, 0.20f, 0.95f, 1.0f}; // purple
+constexpr float FIX_MARKER_POINT_SCALE = 12.0f;
+
+// RE-ANCHOR fixes (AnchorFixMarker::from_reinit) — requested because the VO
+// chain restarted, not because the cadence came round. Different HUE and a
+// SQUARE point, so the two kinds stay distinguishable even in a greyscale
+// screenshot; bigger, because a re-anchor is a rare event worth finding.
+constexpr float FIX_REINIT_ACCEPTED_COLOR[4] = {0.10f, 1.00f, 0.60f, 1.0f}; // green
+constexpr float FIX_REINIT_REJECTED_COLOR[4] = {1.00f, 0.45f, 0.00f, 1.0f}; // orange
+constexpr float FIX_REINIT_MARKER_POINT_SCALE = 16.0f;
+
+// Colour of the permanent contamination banner (setAnchorOverlay).
+constexpr float WARNING_TEXT_COLOR[4] = {1.00f, 0.25f, 0.25f, 1.0f};
+
+// Run-control button (setRunControl): the labels it alternates between, plus
+// the terminal one. RUN_BUTTON_FINISHED is drawn DISABLED — once the pipeline
+// has been shut down for good, offering "Start" would be a lie the user only
+// finds out about by clicking it.
+constexpr const char* RUN_BUTTON_START    = "Start";
+constexpr const char* RUN_BUTTON_STOP     = "Stop";
+constexpr const char* RUN_BUTTON_FINISHED = "Finished";
+// Explanation drawn next to the disabled button, so the grey widget is not a
+// mystery: the run is over and only closing the window is left.
+constexpr const char* RUN_FINISHED_HINT =
+    "run over - close the window to exit";
 
 // Draw one auto-follow streaming line chart of `values` vs `xs`.
 //
@@ -218,6 +254,181 @@ void drawPerfWindow(bool* open,
     ImGui::End();
 }
 
+// Nearest-rank percentile of an ALREADY SORTED sample vector (same ruler as
+// tests/eval_common.cpp::percentile, so a number read off this window and one
+// computed by the offline evaluator mean the same thing). q in [0, 1].
+double sorted_percentile(const std::vector<double>& sorted, double q) {
+    if (sorted.empty()) {
+        return 0.0;
+    }
+    const double rank = q * static_cast<double>(sorted.size());
+    auto idx = static_cast<std::size_t>(std::ceil(rank));
+    if (idx == 0) {
+        idx = 1;
+    }
+    if (idx > sorted.size()) {
+        idx = sorted.size();
+    }
+    return sorted[idx - 1];
+}
+
+// Draw the "Error (m)" window: predicted-vs-groundtruth position error, fed by
+// pushErrorSample(). Layout, top to bottom: a running summary line, a per-frame
+// line chart, and a distribution histogram — the same line+histogram pair the
+// metric windows use, so the two read alike.
+//
+// The summary deliberately reports count / mean / MEDIAN / p95 / max rather
+// than a lone mean: a single number hides the tail this project cares about
+// (.claude/rules/reporting.md requires median · p95 · max). It is recomputed
+// from the whole retained history every frame — O(n log n) on a ring buffer
+// capped at metric_plot_history, and only while the window is open.
+// Render-thread only.
+void drawErrorWindow(bool* open,
+                     const std::vector<double>& frame_x,
+                     const std::vector<double>& err_2d,
+                     const std::vector<double>& err_3d,
+                     bool* use_3d,
+                     int   hist_bins,
+                     int   follow_window) {
+    ImGui::SetNextWindowSize(ImVec2(METRIC_PLOT_W, METRIC_PLOT_H),
+                             ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("Error (m)", open)) {
+        ImGui::End();
+        return;
+    }
+
+    // Horizontal error is the default reading; the 3D one adds the altitude
+    // component, which has its own (telemetry-AGL) error budget.
+    ImGui::Checkbox("3D (include altitude)", use_3d);
+
+    const std::vector<double>& values = *use_3d ? err_3d : err_2d;
+    const int                  n      = static_cast<int>(values.size());
+    if (n == 0) {
+        ImGui::TextUnformatted("No samples yet "
+                               "(the producer pushes one per fused frame that "
+                               "has a groundtruth of the same frame id).");
+        ImGui::End();
+        return;
+    }
+
+    // Running summary over the whole retained history.
+    std::vector<double> sorted(values);
+    std::sort(sorted.begin(), sorted.end());
+    double sum = 0.0;
+    for (double v : values) {
+        sum += v;
+    }
+    const double mean   = sum / static_cast<double>(n);
+    const double median = sorted_percentile(sorted, 0.50);
+    const double p95    = sorted_percentile(sorted, 0.95);
+    const double max_v  = sorted.back();
+
+    ImGui::Text("n = %d   mean = %.2f m   median = %.2f m   p95 = %.2f m   "
+                "max = %.2f m", n, mean, median, p95, max_v);
+    ImGui::Text("last  = %.2f m  (frame %.0f)", values.back(),
+                frame_x.empty() ? 0.0 : frame_x.back());
+    ImGui::Separator();
+
+    const ImVec2 avail  = ImGui::GetContentRegionAvail();
+    const float  line_h = avail.y * 0.5f;
+    const int    bins   = std::max(1, hist_bins);
+    const char*  label  = *use_3d ? "err_3d (m)" : "err_2d (m)";
+
+    drawStreamingLine("##err_line", "frame", label, frame_x, values,
+                      follow_window, line_h);
+
+    if (ImPlot::GetCurrentContext() != nullptr) {
+        if (ImPlot::BeginPlot("##err_hist", ImVec2(-1, -1))) {
+            ImPlot::SetupAxes(label, "count", 0, 0);
+            ImPlot::PlotHistogram(label, values.data(), n, bins);
+            ImPlot::EndPlot();
+        }
+    } else {
+        // ImGui core fallback: manually binned histogram (same policy as
+        // drawMetricWindow).
+        const double mn = sorted.front();
+        const double mx = sorted.back();
+        std::vector<float> counts(static_cast<std::size_t>(bins), 0.0f);
+        const double range = std::max(mx - mn, 1e-9);
+        for (double v : values) {
+            int b = static_cast<int>((v - mn) / range * bins);
+            b = std::max(0, std::min(bins - 1, b));
+            counts[static_cast<std::size_t>(b)] += 1.0f;
+        }
+        ImGui::PlotHistogram("##err_hist", counts.data(), bins, 0, label,
+                             0.0f, FLT_MAX, ImVec2(-1, -1));
+    }
+
+    ImGui::End();
+}
+
+// Draw the "Profiling" window: one table row per measured computation block,
+// showing the MEAN runtime (the headline number) plus last/max/calls/share.
+// Fed by pushProfile(); the row order is the producer's (stable, no flicker).
+// Render-thread only.
+void drawProfileWindow(bool* open, const ProfileSnapshot& snap) {
+    ImGui::SetNextWindowSize(ImVec2(PROFILE_TABLE_W, PROFILE_TABLE_H),
+                             ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("Profiling", open)) {
+        ImGui::End();
+        return;
+    }
+
+    if (snap.rows.empty()) {
+        ImGui::TextUnformatted("No samples yet "
+                               "(profiling is opt-in: set UAVLOC_PROFILE=1).");
+        ImGui::End();
+        return;
+    }
+
+    ImGui::Text("frame %d   t = %.1f s", snap.frame_id, snap.t_sec);
+    ImGui::Separator();
+
+    const ImGuiTableFlags flags = ImGuiTableFlags_Borders |
+                                  ImGuiTableFlags_RowBg |
+                                  ImGuiTableFlags_SizingStretchProp |
+                                  ImGuiTableFlags_ScrollY;
+    if (ImGui::BeginTable("profile_table", 6, flags)) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("Module");
+        ImGui::TableSetupColumn("mean ms");
+        ImGui::TableSetupColumn("last ms");
+        ImGui::TableSetupColumn("max ms");
+        ImGui::TableSetupColumn("calls");
+        ImGui::TableSetupColumn("%");
+        ImGui::TableHeadersRow();
+
+        double mean_sum = 0.0;
+        for (const ProfileRow& r : snap.rows) {
+            mean_sum += static_cast<double>(r.mean_ms);
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            ImGui::TextUnformatted(r.name.c_str());
+            ImGui::TableSetColumnIndex(1);
+            ImGui::Text("%.3f", r.mean_ms);
+            ImGui::TableSetColumnIndex(2);
+            ImGui::Text("%.3f", r.last_ms);
+            ImGui::TableSetColumnIndex(3);
+            ImGui::Text("%.3f", r.max_ms);
+            ImGui::TableSetColumnIndex(4);
+            ImGui::Text("%llu", static_cast<unsigned long long>(r.count));
+            ImGui::TableSetColumnIndex(5);
+            ImGui::Text("%.1f", r.percent);
+        }
+
+        // Total row: the sum of the per-block means (blocks may nest, so this is
+        // a reference figure, not a wall-clock budget).
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(0);
+        ImGui::TextUnformatted("TOTAL (sum of means)");
+        ImGui::TableSetColumnIndex(1);
+        ImGui::Text("%.3f", mean_sum);
+        ImGui::EndTable();
+    }
+
+    ImGui::End();
+}
+
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
@@ -269,6 +480,35 @@ struct DebugViewer::Impl {
     std::vector<Eigen::Quaternionf,
                 Eigen::aligned_allocator<Eigen::Quaternionf>> fused_quats;
     std::vector<uint64_t>        fused_frame_ids;
+
+    // Absolute-position fix markers (setAnchorFixes): a REPLACE-style snapshot,
+    // because a fix's accepted/rejected verdict is only known later and the
+    // producer re-pushes the corrected list. Producer stores raw display-ENU
+    // metres under anchor_fix_mutex_; the render thread splits them into the
+    // FOUR render-unit clouds below on the dirty flag — verdict (accepted /
+    // rejected) crossed with origin (cadence / re-anchor), because a drawable
+    // carries one colour and one point shape.
+    std::mutex                   anchor_fix_mutex_;
+    std::vector<AnchorFixMarker> anchor_fix_latest_;
+    std::atomic<bool>            anchor_fix_dirty_{false};
+    std::vector<Eigen::Vector3f> anchor_fix_accepted_render_;
+    std::vector<Eigen::Vector3f> anchor_fix_rejected_render_;
+    std::vector<Eigen::Vector3f> anchor_fix_reinit_accepted_render_;
+    std::vector<Eigen::Vector3f> anchor_fix_reinit_rejected_render_;
+
+    // Run-control button (setRunControl / setRunState). The handler is owned by
+    // the driver and invoked WITHOUT run_control_mutex_ held (it calls into the
+    // pipeline, which may take its own locks and join threads).
+    std::mutex                          run_control_mutex_;
+    DebugViewer::RunControlHandler      run_control_;
+    std::atomic<bool>                   run_control_set_{false};
+    std::atomic<DebugViewer::RunState>  run_state_{DebugViewer::RunState::IDLE};
+
+    // Two banner lines drawn at the top of the main panel (setAnchorOverlay):
+    // a permanent RED warning and a plain counter line.
+    std::mutex  banner_mutex_;
+    std::string banner_warning_;
+    std::string banner_stats_;
 
     // Latest map-point cloud (drop-oldest snapshot), fed via pushMapPoints().
     // Producer stores raw display-ENU metres under map_points_mutex_; the render
@@ -331,6 +571,22 @@ struct DebugViewer::Impl {
     std::vector<double>    perf_cpu_;
     std::vector<double>    perf_rss_;
 
+    // Predicted-vs-groundtruth error samples (producer: any thread) drained
+    // under queue_mutex like the metrics, into the render-thread-only histories
+    // feeding the "Error (m)" window (x = frame id).
+    std::deque<ErrorSample> error_q_;
+    std::vector<double>     error_frame_x_;
+    std::vector<double>     error_2d_;
+    std::vector<double>     error_3d_;
+
+    // Profiling table: a single LATEST-WINS slot (the table shows only the
+    // newest snapshot, so queueing older ones would be pure waste). Producer:
+    // any thread, under queue_mutex; consumer: the render thread, which copies
+    // it into profile_render_ on the dirty flag.
+    ProfileSnapshot   profile_latest_;
+    std::atomic<bool> profile_dirty_{false};
+    ProfileSnapshot   profile_render_;
+
     // Latest video frame: single drop-oldest slot (producer: worker).
     std::mutex        frame_mutex_;
     cv::Mat           frame_latest_;
@@ -358,8 +614,19 @@ struct DebugViewer::Impl {
     bool show_lost_poses_   = false;
     bool lost_markers_active_ = false;
     bool map_points_active_ = false;
+    // "Anchor fixes" checkbox + whether each of the four marker clouds is live.
+    bool show_anchor_fixes_       = true;
+    bool anchor_fix_accepted_active_ = false;
+    bool anchor_fix_rejected_active_ = false;
+    bool anchor_fix_reinit_accepted_active_ = false;
+    bool anchor_fix_reinit_rejected_active_ = false;
     bool show_hud_          = false;
     bool show_perf_         = false;
+    bool show_profile_      = false;
+    // "Error (m)" checkbox + which of the two error series the window plots
+    // (in-window "3D (include altitude)" checkbox; horizontal is the default).
+    bool show_error_        = false;
+    bool error_use_3d_      = false;
     // "VO" checkbox: master gate for the VO estimate trajectory (orange
     // polyline, or orange pose-axes chain in EstOdom mode). Estimate data
     // keeps accumulating while hidden — same semantics as GroundTruth.
@@ -395,6 +662,12 @@ struct DebugViewer::Impl {
     float hud_distance_    = 0.0f;
 
     BarcodeDecoder decoder;
+
+    // Bridge to a core::SystemManager (attach()): the four channel handlers,
+    // the display anchoring, and the two threads that own the run. Null until
+    // attach() is called — a bare viewer (demo_debug_viewer, TrajectoryViewer
+    // users) never allocates one.
+    std::unique_ptr<SystemBridge> bridge;
 
     // ---- helpers -----------------------------------------------------------
 
@@ -555,6 +828,81 @@ void DebugViewer::pushFusedCorrection(const std::vector<FusedCorrection>& correc
     impl_->fused_q_.push_back(std::move(ev));
 }
 
+void DebugViewer::setAnchorFixes(const std::vector<AnchorFixMarker>& fixes) {
+    {
+        std::lock_guard<std::mutex> lock(impl_->anchor_fix_mutex_);
+        impl_->anchor_fix_latest_ = fixes;
+    }
+    impl_->anchor_fix_dirty_.store(true);
+}
+
+void DebugViewer::setAnchorOverlay(const std::string& warning,
+                                   const std::string& stats) {
+    std::lock_guard<std::mutex> lock(impl_->banner_mutex_);
+    impl_->banner_warning_ = warning;
+    impl_->banner_stats_   = stats;
+}
+
+// ---------------------------------------------------------------------------
+// Bridge to the pipeline — thin delegation; the logic lives in SystemBridge
+// (src/debug_viewer/debug_viewer_bridge.{h,cpp}). It sits here only because
+// SystemBridge is owned by the pimpl, which is private to this TU.
+// ---------------------------------------------------------------------------
+void DebugViewer::attach(core::SystemManager& sys) {
+    if (!impl_->bridge) {
+        impl_->bridge = std::make_unique<SystemBridge>(*this, impl_->cfg);
+    }
+    impl_->bridge->attach(sys);
+}
+
+void DebugViewer::setFusedPoseSink(FusedPoseSink sink) {
+    if (!impl_->bridge) {
+        impl_->bridge = std::make_unique<SystemBridge>(*this, impl_->cfg);
+    }
+    impl_->bridge->setFusedPoseSink(std::move(sink));
+}
+
+void DebugViewer::pushAnchorFix(const Eigen::Vector2d& xy_fusion_enu,
+                                bool from_reinit) {
+    if (!impl_->bridge) {
+        spdlog::warn("DebugViewer::pushAnchorFix: no system attached — fix dropped");
+        return;
+    }
+    impl_->bridge->pushAnchorFix(xy_fusion_enu, from_reinit);
+}
+
+void DebugViewer::enableAnchorFixTracking(const std::string& contamination_warning) {
+    if (!impl_->bridge) {
+        impl_->bridge = std::make_unique<SystemBridge>(*this, impl_->cfg);
+    }
+    impl_->bridge->enableAnchorFixTracking(contamination_warning);
+}
+
+AnchorFixCounters DebugViewer::anchorFixCounters() const {
+    if (!impl_->bridge) {
+        return AnchorFixCounters{};
+    }
+    return impl_->bridge->anchorFixCounters();
+}
+
+void DebugViewer::setRunControl(RunControlHandler handler) {
+    const bool has = static_cast<bool>(handler);
+    {
+        std::lock_guard<std::mutex> lock(impl_->run_control_mutex_);
+        impl_->run_control_ = std::move(handler);
+    }
+    impl_->run_control_set_.store(has);
+    spdlog::debug("DebugViewer: run control {}", has ? "installed" : "removed");
+}
+
+void DebugViewer::setRunState(RunState state) {
+    impl_->run_state_.store(state);
+}
+
+DebugViewer::RunState DebugViewer::runState() const {
+    return impl_->run_state_.load();
+}
+
 void DebugViewer::pushMapPoints(const std::vector<Eigen::Vector3f>& pts_enu) {
     {
         // Replace the single drop-oldest snapshot so the render thread always
@@ -573,6 +921,21 @@ void DebugViewer::pushMetrics(const FrameMetrics& m) {
 void DebugViewer::pushPerf(const PerfSample& s) {
     std::lock_guard<std::mutex> lock(impl_->queue_mutex);
     impl_->perf_q_.push_back(s);
+}
+
+void DebugViewer::pushErrorSample(const ErrorSample& s) {
+    std::lock_guard<std::mutex> lock(impl_->queue_mutex);
+    impl_->error_q_.push_back(s);
+}
+
+void DebugViewer::pushProfile(const ProfileSnapshot& p) {
+    {
+        // Replace the single latest-wins slot so the render thread always reads
+        // a complete table (never a half-updated one).
+        std::lock_guard<std::mutex> lock(impl_->queue_mutex);
+        impl_->profile_latest_ = p;
+    }
+    impl_->profile_dirty_.store(true);
 }
 
 void DebugViewer::pushFrame(const cv::Mat& image) {
@@ -629,11 +992,23 @@ void DebugViewer::run() {
     impl_->show_lost_poses_ = impl_->cfg.show_lost_poses;
     impl_->show_hud_       = impl_->cfg.show_hud;
     impl_->show_perf_      = impl_->cfg.show_perf;
+    impl_->show_profile_   = impl_->cfg.show_profile;
+    impl_->show_error_     = impl_->cfg.show_error;
     impl_->show_estimate_    = impl_->cfg.show_estimate;
     impl_->show_groundtruth_ = impl_->cfg.show_groundtruth;
     impl_->show_est_odom_    = impl_->cfg.est_odom;
     impl_->follow_camera_    = impl_->cfg.follow_camera;
     impl_->show_fused_       = impl_->cfg.show_fused;
+    impl_->show_anchor_fixes_ = impl_->cfg.show_anchor_fixes;
+
+    // --- Own the run: auto-start + supervisor + perf sampler (S4). ----------
+    // Deliberately BEFORE the GL init, which is where the driver used to do it:
+    // the pipeline must come up at the same point in the sequence as before.
+    // A refused auto-start spawned no thread, so there is nothing to join and
+    // returning here cannot hang.
+    if (impl_->bridge && !impl_->bridge->begin()) {
+        return;
+    }
 
     // --- Decide whether a GL window can be opened. -------------------------
     guik::LightViewer* viewer = nullptr;
@@ -671,6 +1046,78 @@ void DebugViewer::run() {
         viewer->register_ui_callback("debug_status", [this]() {
             ImGui::SetNextWindowSize(ImVec2(320, 200), ImGuiCond_FirstUseEver);
             ImGui::Begin("Debug Viewer");
+            // Run control ABOVE the banner: it carries no numbers, so it cannot
+            // detach a figure from its caveat, and it is the one widget the user
+            // looks for first. Drawn only when a driver installed a handler.
+            if (impl_->run_control_set_.load()) {
+                const RunState state = impl_->run_state_.load();
+                const bool running  = (state == RunState::RUNNING);
+                const bool finished = (state == RunState::FINISHED);
+                // Terminal state: the pipeline is down for good, so the widget
+                // must not invite a click. Grey it out and say why, instead of
+                // showing "Start" and refusing in the log where nobody looks.
+                if (finished) {
+                    ImGui::BeginDisabled(true);
+                    ImGui::Button(RUN_BUTTON_FINISHED);
+                    ImGui::EndDisabled();
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("%s", RUN_FINISHED_HINT);
+                } else if (ImGui::Button(running ? RUN_BUTTON_STOP
+                                                 : RUN_BUTTON_START)) {
+                    const bool want_run = !running;
+                    RunControlHandler handler;
+                    {
+                        std::lock_guard<std::mutex> lock(impl_->run_control_mutex_);
+                        handler = impl_->run_control_;
+                    }
+                    // Called with no viewer lock held: the handler drives the
+                    // pipeline and may block (it joins the reading thread).
+                    // Exceptions must not escape into the GL loop.
+                    bool ok = false;
+                    try {
+                        ok = handler && handler(want_run);
+                    } catch (const std::exception& ex) {
+                        spdlog::error("DebugViewer: run control threw: {}", ex.what());
+                    } catch (...) {
+                        spdlog::error("DebugViewer: run control threw a non-std exception");
+                    }
+                    if (ok) {
+                        impl_->run_state_.store(want_run ? RunState::RUNNING
+                                                         : RunState::PAUSED);
+                        spdlog::info("DebugViewer: run control -> {}",
+                                     want_run ? "RUNNING" : "PAUSED");
+                    } else {
+                        spdlog::error("DebugViewer: run control refused the "
+                                      "{} request — button state unchanged",
+                                      want_run ? "start/resume" : "pause");
+                    }
+                }
+                ImGui::Separator();
+            }
+            // Contamination banner FIRST, before any number this window shows:
+            // a screenshot must carry the caveat with it.
+            {
+                std::string warning, stats;
+                {
+                    std::lock_guard<std::mutex> lock(impl_->banner_mutex_);
+                    warning = impl_->banner_warning_;
+                    stats   = impl_->banner_stats_;
+                }
+                if (!warning.empty()) {
+                    ImGui::PushStyleColor(
+                        ImGuiCol_Text,
+                        ImVec4(WARNING_TEXT_COLOR[0], WARNING_TEXT_COLOR[1],
+                               WARNING_TEXT_COLOR[2], WARNING_TEXT_COLOR[3]));
+                    ImGui::TextWrapped("%s", warning.c_str());
+                    ImGui::PopStyleColor();
+                }
+                if (!stats.empty()) {
+                    ImGui::TextWrapped("%s", stats.c_str());
+                }
+                if (!warning.empty() || !stats.empty()) {
+                    ImGui::Separator();
+                }
+            }
             ImGui::Text("Groundtruth pts : %zu", impl_->gt_points.size());
             ImGui::Text("Inferred pts    : %zu", impl_->inferred_points.size());
             if (impl_->origin_set) {
@@ -688,11 +1135,14 @@ void DebugViewer::run() {
             ImGui::Checkbox("Lost state poses", &impl_->show_lost_poses_);
             ImGui::Checkbox("HUD", &impl_->show_hud_);
             ImGui::Checkbox("Performance", &impl_->show_perf_);
+            ImGui::Checkbox("Profiling", &impl_->show_profile_);
+            ImGui::Checkbox("Error (m)", &impl_->show_error_);
             ImGui::Checkbox("VO", &impl_->show_estimate_);
             ImGui::Checkbox("GroundTruth", &impl_->show_groundtruth_);
             ImGui::Checkbox("EstOdom", &impl_->show_est_odom_);
             ImGui::Checkbox("Follow camera", &impl_->follow_camera_);
             ImGui::Checkbox("Fused", &impl_->show_fused_);
+            ImGui::Checkbox("Anchor fixes", &impl_->show_anchor_fixes_);
             ImGui::End();
 
             // HUD: VO course-over-ground heading, telemetry heading, path length.
@@ -747,6 +1197,14 @@ void DebugViewer::run() {
             if (impl_->show_perf_) {
                 drawPerfWindow(&impl_->show_perf_, impl_->perf_t_,
                                impl_->perf_cpu_, impl_->perf_rss_, follow_win);
+            }
+            if (impl_->show_profile_) {
+                drawProfileWindow(&impl_->show_profile_, impl_->profile_render_);
+            }
+            if (impl_->show_error_) {
+                drawErrorWindow(&impl_->show_error_, impl_->error_frame_x_,
+                                impl_->error_2d_, impl_->error_3d_,
+                                &impl_->error_use_3d_, hist_bins, follow_win);
             }
         });
     }
@@ -970,6 +1428,77 @@ void DebugViewer::run() {
             impl_->lost_markers_active_ = false;
         }
     };
+    // Absolute-position fix markers, gated by the "Anchor fixes" checkbox: four
+    // clouds, the accepted/rejected verdict crossed with the cadence/re-anchor
+    // origin (yellow and purple CIRCLES for the regular cadence, green and
+    // orange SQUARES for a re-anchor). A fresh setAnchorFixes() snapshot
+    // re-splits and re-uploads all of them; otherwise this only honours the
+    // checkbox toggle.
+    auto refresh_anchor_fixes = [&]() {
+        if (!viewer) return;
+        bool rebuild = false;
+        if (impl_->anchor_fix_dirty_.exchange(false)) {
+            std::lock_guard<std::mutex> lock(impl_->anchor_fix_mutex_);
+            impl_->anchor_fix_accepted_render_.clear();
+            impl_->anchor_fix_rejected_render_.clear();
+            impl_->anchor_fix_reinit_accepted_render_.clear();
+            impl_->anchor_fix_reinit_rejected_render_.clear();
+            for (const AnchorFixMarker& m : impl_->anchor_fix_latest_) {
+                const Eigen::Vector3f p =
+                    impl_->applyScale(m.pos.x(), m.pos.y(), m.pos.z());
+                if (m.from_reinit) {
+                    if (m.accepted) {
+                        impl_->anchor_fix_reinit_accepted_render_.push_back(p);
+                    } else {
+                        impl_->anchor_fix_reinit_rejected_render_.push_back(p);
+                    }
+                } else if (m.accepted) {
+                    impl_->anchor_fix_accepted_render_.push_back(p);
+                } else {
+                    impl_->anchor_fix_rejected_render_.push_back(p);
+                }
+            }
+            rebuild = true;
+        }
+        auto refresh_one = [&](const char* name,
+                               const std::vector<Eigen::Vector3f>& pts,
+                               const float (&color)[4], float point_scale,
+                               bool square, bool& active) {
+            if (impl_->show_anchor_fixes_ && !pts.empty()) {
+                if (rebuild || !active) {
+                    guik::ShaderSetting setting =
+                        guik::FlatColor(color[0], color[1], color[2], color[3]);
+                    setting.set_point_scale(point_scale);
+                    if (square) {
+                        setting.set_point_shape_rectangle();
+                    } else {
+                        setting.set_point_shape_circle();
+                    }
+                    viewer->update_drawable(
+                        name, std::make_shared<glk::PointCloudBuffer>(pts),
+                        setting);
+                    active = true;
+                }
+            } else if (active) {
+                viewer->remove_drawable(name);
+                active = false;
+            }
+        };
+        refresh_one("anchor_fix_accepted", impl_->anchor_fix_accepted_render_,
+                    FIX_ACCEPTED_COLOR, FIX_MARKER_POINT_SCALE, false,
+                    impl_->anchor_fix_accepted_active_);
+        refresh_one("anchor_fix_rejected", impl_->anchor_fix_rejected_render_,
+                    FIX_REJECTED_COLOR, FIX_MARKER_POINT_SCALE, false,
+                    impl_->anchor_fix_rejected_active_);
+        refresh_one("anchor_fix_reinit_accepted",
+                    impl_->anchor_fix_reinit_accepted_render_,
+                    FIX_REINIT_ACCEPTED_COLOR, FIX_REINIT_MARKER_POINT_SCALE,
+                    true, impl_->anchor_fix_reinit_accepted_active_);
+        refresh_one("anchor_fix_reinit_rejected",
+                    impl_->anchor_fix_reinit_rejected_render_,
+                    FIX_REINIT_REJECTED_COLOR, FIX_REINIT_MARKER_POINT_SCALE,
+                    true, impl_->anchor_fix_reinit_rejected_active_);
+    };
     // VO map-point cloud (light blue), gated by the "Landmarks" checkbox. When a
     // fresh snapshot arrived (dirty), it is scaled into render units and the
     // drawable is re-uploaded; otherwise this only honours the checkbox toggle
@@ -1149,6 +1678,9 @@ void DebugViewer::run() {
         // Refresh the VO map-point cloud (honours the "Landmarks" checkbox and
         // any fresh pushMapPoints() snapshot).
         refresh_map_points();
+        // Same for the absolute-fix markers ("Anchor fixes" checkbox +
+        // setAnchorFixes() snapshot).
+        refresh_anchor_fixes();
     };
 
     // Drain the UI-panel queues (metrics + video) and push them to guik. Runs
@@ -1212,6 +1744,42 @@ void DebugViewer::run() {
             trim_perf(impl_->perf_t_);
             trim_perf(impl_->perf_cpu_);
             trim_perf(impl_->perf_rss_);
+        }
+
+        // 1b2) Error samples: same swap-drain, into the histories feeding the
+        //      "Error (m)" line chart + histogram. Capped by the same
+        //      metric_plot_history the per-frame metric charts use, so the
+        //      running summary is a summary of a BOUNDED window, not of the
+        //      whole flight — say so wherever the number is quoted.
+        std::deque<ErrorSample> error_local;
+        {
+            std::lock_guard<std::mutex> lock(impl_->queue_mutex);
+            error_local.swap(impl_->error_q_);
+        }
+        if (!error_local.empty()) {
+            const std::size_t err_cap = static_cast<std::size_t>(
+                std::max(1, impl_->cfg.metric_plot_history));
+            for (const auto& s : error_local) {
+                impl_->error_frame_x_.push_back(static_cast<double>(s.frame_id));
+                impl_->error_2d_.push_back(static_cast<double>(s.err_2d_m));
+                impl_->error_3d_.push_back(static_cast<double>(s.err_3d_m));
+            }
+            auto trim_err = [err_cap](std::vector<double>& v) {
+                if (v.size() > err_cap) {
+                    v.erase(v.begin(),
+                            v.begin() + static_cast<std::ptrdiff_t>(v.size() - err_cap));
+                }
+            };
+            trim_err(impl_->error_frame_x_);
+            trim_err(impl_->error_2d_);
+            trim_err(impl_->error_3d_);
+        }
+
+        // 1c) Profiling table: latest-wins single slot, copied into the
+        //     render-thread-only snapshot the "Profiling" window formats.
+        if (impl_->profile_dirty_.exchange(false)) {
+            std::lock_guard<std::mutex> lock(impl_->queue_mutex);
+            impl_->profile_render_ = impl_->profile_latest_;
         }
 
         // 2) The metric line/histogram windows are drawn directly in the
@@ -1283,6 +1851,11 @@ void DebugViewer::run() {
                 std::chrono::milliseconds(VIEWER_SPIN_SLEEP_MS));
         }
         guik::LightViewer::destroy();
+        // Both service threads are joined BEFORE run() returns, on this
+        // headless-capable branch as much as on the GUI one.
+        if (impl_->bridge) {
+            impl_->bridge->end(impl_->had_display.load());
+        }
         spdlog::info("DebugViewer: push/pre-loaded run finished");
         return;
     }
@@ -1293,6 +1866,9 @@ void DebugViewer::run() {
     if (!cap.isOpened()) {
         spdlog::error("DebugViewer::run: cannot open video: {}", impl_->video_path);
         guik::LightViewer::destroy();
+        if (impl_->bridge) {
+            impl_->bridge->end(impl_->had_display.load());
+        }
         return;
     }
     spdlog::info("DebugViewer: streaming video {} ({}x{}, {} frames)",
@@ -1369,6 +1945,9 @@ void DebugViewer::run() {
     }
 
     guik::LightViewer::destroy();
+    if (impl_->bridge) {
+        impl_->bridge->end(impl_->had_display.load());
+    }
 }
 
 } // namespace uavloc::debug_viewer

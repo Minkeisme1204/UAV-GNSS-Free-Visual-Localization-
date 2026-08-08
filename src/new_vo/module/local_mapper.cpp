@@ -10,6 +10,7 @@
 #include "uavloc/new_vo/optimize/local_bundle_adjuster.h"
 #include "uavloc/new_vo/optimize/local_bundle_adjuster_factory.h"
 #include "uavloc/new_vo/solve/essential_solver.h"
+#include "uavloc/util/scoped_timer.h"
 
 #include <algorithm>
 #include <cmath>
@@ -48,23 +49,39 @@ void LocalMapper::map(const std::shared_ptr<data::Keyframe>& cur_keyfrm,
     }
 
     // Register the keyframe (queue landmarks, update graph, add to the map DB).
-    store_new_keyframe(cur_keyfrm);
+    {
+        util::ScopedTimer _t(util::ProfileStage::MAP_STORE_KF);
+        store_new_keyframe(cur_keyfrm);
+    }
 
     // Remove landmarks that turned out unreliable.
-    local_map_cleaner_->remove_invalid_landmarks(cur_keyfrm->id_);
+    {
+        util::ScopedTimer _t(util::ProfileStage::MAP_CULL_LM);
+        local_map_cleaner_->remove_invalid_landmarks(cur_keyfrm->id_);
+    }
 
     // Triangulate new landmarks against the covisibility neighbors.
-    create_new_landmarks(cur_keyfrm, abort_landmark_gen);
+    {
+        util::ScopedTimer _t(util::ProfileStage::MAP_CREATE_LM);
+        create_new_landmarks(cur_keyfrm, abort_landmark_gen);
+    }
 
     // Merge duplicate landmarks between the keyframe and its covisibilities.
-    fuse_landmark_duplication(cur_keyfrm, replaced_lms);
+    {
+        util::ScopedTimer _t(util::ProfileStage::MAP_FUSE_LM);
+        fuse_landmark_duplication(cur_keyfrm, replaced_lms);
+    }
 
     // Refresh the covisibility graph after new landmark associations.
-    cur_keyfrm->graph_node_->update_connections(map_db_->get_min_num_shared_lms());
+    {
+        util::ScopedTimer _t(util::ProfileStage::MAP_UPDATE_CONN);
+        cur_keyfrm->graph_node_->update_connections(map_db_->get_min_num_shared_lms());
+    }
 
     // Local bundle adjustment (needs a non-trivial window of keyframes). Skipped
     // under async backpressure so the mapping queue can drain.
     if (2 < map_db_->get_num_keyframes() && !skip_local_ba) {
+        util::ScopedTimer _t(util::ProfileStage::MAP_LOCAL_BA);
         bool local_abort = false;
         local_bundle_adjuster_->optimize(map_db_, cur_keyfrm,
                                          force_stop_flag ? force_stop_flag : &local_abort);
@@ -78,6 +95,9 @@ void LocalMapper::map(const std::shared_ptr<data::Keyframe>& cur_keyfrm,
     // more than num_temporal_keyframes_ ids ahead — the bounded-VO sliding
     // window. Off by default (erase_temporal_keyframes_ = false).
     if (erase_temporal_keyframes_) {
+        // Same stage as the redundant-keyframe cull below (both are keyframe
+        // culling); off by default, so MAP_CULL_KF then has one sample per map().
+        util::ScopedTimer _t(util::ProfileStage::MAP_CULL_KF);
         for (const auto& keyfrm : map_db_->get_all_keyframes()) {
             if (keyfrm->id_ <= map_db_->get_fixed_keyframe_id_threshold()) {
                 continue;
@@ -107,7 +127,10 @@ void LocalMapper::map(const std::shared_ptr<data::Keyframe>& cur_keyfrm,
     }
 
     // Cull redundant keyframes.
-    local_map_cleaner_->remove_redundant_keyframes(cur_keyfrm);
+    {
+        util::ScopedTimer _t(util::ProfileStage::MAP_CULL_KF);
+        local_map_cleaner_->remove_redundant_keyframes(cur_keyfrm);
+    }
 }
 
 void LocalMapper::reset() {

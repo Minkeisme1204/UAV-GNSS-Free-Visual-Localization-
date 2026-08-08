@@ -2,6 +2,8 @@
 
 #include "factors.h"
 
+#include "uavloc/util/scoped_timer.h"
+
 #include <gtsam/geometry/Pose3.h>
 #include <gtsam/inference/Symbol.h>
 #include <gtsam/linear/NoiseModel.h>
@@ -12,11 +14,16 @@
 
 #include <spdlog/spdlog.h>
 
+#include <Eigen/Cholesky>
+
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <condition_variable>
 #include <deque>
+#include <exception>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -24,10 +31,6 @@
 namespace uavloc::fusion {
 
 namespace {
-
-//! Placeholder health rule: INITIALIZING until this many keyframes are in the
-//! graph, then CONVERGED (kcb §2.3 state machine arrives in a later step).
-constexpr unsigned int HEALTH_CONVERGED_MIN_KEYFRAMES = 5;
 
 //! Soft queue-depth threshold: the queue never drops items (keyframes are
 //! required by the graph), but growth beyond this depth is logged (once per
@@ -48,6 +51,18 @@ constexpr double GIMBAL_TILT_NADIR_DEG     = 90.0;
 constexpr double GIMBAL_TILT_MIN_VALID_DEG = 45.0;
 //! Below this cos(off-nadir) the depth↔AGL relation degenerates (grazing view).
 constexpr double MIN_COS_OFF_NADIR = 1e-6;
+
+//! Capacity of the absolute-fix intake queue. Unlike queue_ (keyframes, which
+//! the graph cannot do without and which are therefore never dropped), a fix
+//! that the pipeline could not consume in time is worthless: the queue drops
+//! the OLDEST entry so a burst of fixes can neither stall the producer nor
+//! grow without bound. Sized far above the expected in-flight count (at most
+//! one fix per keyframe interval).
+constexpr std::size_t FIX_QUEUE_CAPACITY = 64;
+
+//! Index of the translation block inside the Pose3 tangent ordering
+//! (rx, ry, rz, x, y, z) — used to slice marginalCovariance().
+constexpr int POSE3_TANGENT_TRANS_INDEX = 3;
 
 constexpr double MSEC_TO_SEC = 1e-3;
 constexpr double DEG_TO_RAD  = M_PI / 180.0;
@@ -127,6 +142,60 @@ struct FusionModule::Impl {
         process(item);
     }
 
+    //! Producer side of the absolute-fix intake (any thread). Only validation
+    //! and queueing happen here — matching, gating and graph insertion run on
+    //! the process() thread inside addKeyframe().
+    void push_absolute_fix(const anchor::AbsoluteFix& fix) {
+        if (!fix.valid) {
+            spdlog::debug("FusionModule: absolute fix ignored — valid == false");
+            return;
+        }
+        if (!fix.xy_enu.allFinite() || !isUsableCovariance(fix.cov)) {
+            spdlog::warn("FusionModule: absolute fix rejected — non-finite "
+                         "position or non-SPD covariance");
+            return;
+        }
+        fix_injected_.fetch_add(1, std::memory_order_relaxed);
+
+        if (!initialized_.load(std::memory_order_acquire)) {
+            // No X(k) exists yet: the ENU frame the fix is expressed in is
+            // only defined once the graph is anchored.
+            fix_no_graph_.fetch_add(1, std::memory_order_relaxed);
+            spdlog::debug("FusionModule: absolute fix dropped — graph not "
+                          "initialized yet");
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(mtx_fix_);
+        if (fix_queue_.size() >= FIX_QUEUE_CAPACITY) {
+            fix_queue_.pop_front();  // drop-oldest
+            fix_queue_dropped_.fetch_add(1, std::memory_order_relaxed);
+            spdlog::warn("FusionModule: absolute-fix queue full ({}) — "
+                         "oldest fix dropped", FIX_QUEUE_CAPACITY);
+        }
+        fix_queue_.push_back(fix);
+    }
+
+    FusionFixStats fix_stats() const {
+        FusionFixStats st;
+        st.injected      = fix_injected_.load(std::memory_order_relaxed);
+        st.applied       = fix_applied_.load(std::memory_order_relaxed);
+        st.gated         = fix_gated_.load(std::memory_order_relaxed);
+        st.low_confidence = fix_low_confidence_.load(std::memory_order_relaxed);
+        st.age_expired   = fix_age_expired_.load(std::memory_order_relaxed);
+        st.unmatched     = fix_unmatched_.load(std::memory_order_relaxed);
+        st.marginalized  = fix_marginalized_.load(std::memory_order_relaxed);
+        st.queue_dropped = fix_queue_dropped_.load(std::memory_order_relaxed);
+        st.no_graph      = fix_no_graph_.load(std::memory_order_relaxed);
+        st.distance_since_fix_m =
+            fix_distance_since_m_.load(std::memory_order_relaxed);
+        st.last_gated_residual_m =
+            fix_last_gated_residual_m_.load(std::memory_order_relaxed);
+        st.last_gated_gate_radius_m =
+            fix_last_gated_radius_m_.load(std::memory_order_relaxed);
+        return st;
+    }
+
     void add_result_callback(std::function<void(const FusionResult&)> cb) {
         if (!cb) {
             return;
@@ -199,7 +268,7 @@ private:
         Eigen::Isometry3d T_wc = Eigen::Isometry3d::Identity();
         T_wc.matrix() = item.res.T_wc;
 
-        if (!initialized_) {
+        if (!initialized_.load(std::memory_order_acquire)) {
             // First keyframe with valid telemetry anchors the graph.
             if (item.res.is_keyframe && item.telem.valid) {
                 initialize(item, T_wc);
@@ -232,11 +301,17 @@ private:
         publish(out);
     }
 
-    //! Fill the auxiliary graph states (current estimates) + health.
+    //! Fill the auxiliary graph states (current estimates) + health +
+    //! horizontal covariance. The covariance is the one computed at the last
+    //! smoother update, i.e. the covariance of X(base_keyframe_id) — on a
+    //! non-keyframe it is carried over unchanged (documented on
+    //! FusionResult::xy_covariance).
     void fillAuxStates(FusionResult& out) const {
-        out.scale      = scale_est_;
-        out.agl_bias_m = bias_est_;
-        out.health     = currentHealth();
+        out.scale            = scale_est_;
+        out.agl_bias_m       = bias_est_;
+        out.health           = health_;
+        out.xy_covariance    = xy_cov_last_kf_;
+        out.covariance_valid = xy_cov_valid_;
     }
 
     //! Measured camera orientation in ENU from a telemetry sample (shared by
@@ -330,12 +405,16 @@ private:
         stamps[S(0)] = t0_sec;
         stamps[B(0)] = t0_sec;
 
-        smoother_->update(graph, values, stamps);
+        {
+            util::ScopedTimer _t(util::ProfileStage::FUSION_GRAPH_UPDATE);
+            smoother_->update(graph, values, stamps);
+        }
 
         T_enu_c_last_kf_.matrix() = smoother_->calculateEstimate<gtsam::Pose3>(X(0)).matrix();
         scale_est_                = smoother_->calculateEstimate<double>(S(0));
         bias_est_                 = smoother_->calculateEstimate<double>(B(0));
 
+        setDistanceSinceFix(0.0);  // the drift budget starts at the anchor
         T_wc_last_kf_        = T_wc;
         last_kf_frame_id_    = item.res.frame_id;
         next_key_            = 1;
@@ -343,11 +422,12 @@ private:
         last_kf_psi_rad_     = psiRad(item.telem);
         last_kf_telem_valid_ = true;  // initialize() requires valid telemetry
         saw_non_tracking_since_kf_ = false;
-        initialized_         = true;
+        initialized_.store(true, std::memory_order_release);
 
         kf_registry_.clear();
-        kf_registry_.push_back({0, item.res.frame_id});
+        kf_registry_.push_back({0, item.res.frame_id, item.res.timestamp_msec});
         rebuildLagWindow();
+        refreshCovarianceAndHealth(0);
 
         spdlog::info("FusionModule: initialized — X(0) anchored at frame {} "
                      "(t={:.3f}s, agl={:.1f} m, heading={:.1f}°)",
@@ -487,6 +567,14 @@ private:
             }
         }
 
+        // 7. Absolute horizontal fixes (anchor::AbsoluteFix) queued since the
+        //    previous keyframe. Consumed BEFORE the update so an accepted fix
+        //    joins this same graph; it attaches to the keyframe state closest
+        //    in time, which may be an EARLIER X(m) — the fixed-lag smoother
+        //    then corrects the past as well, something a forward-only filter
+        //    cannot do. No-op (graph untouched) when the queue is empty.
+        consumeAbsoluteFixes(graph, t_sec);
+
         // Initial estimates: propagate the pose with the current scale. At a
         // boundary the fresh prior mean (1.0) is the better scale guess.
         const double scale_guess = reinit_boundary ? 1.0 : scale_est_;
@@ -503,11 +591,21 @@ private:
         stamps[S(k)] = t_sec;
         stamps[B(k)] = t_sec;
 
-        smoother_->update(graph, values, stamps);
+        {
+            util::ScopedTimer _t(util::ProfileStage::FUSION_GRAPH_UPDATE);
+            smoother_->update(graph, values, stamps);
+        }
 
+        const Eigen::Vector3d p_prev_kf = T_enu_c_last_kf_.translation();
         T_enu_c_last_kf_.matrix() = smoother_->calculateEstimate<gtsam::Pose3>(X(k)).matrix();
         scale_est_                = smoother_->calculateEstimate<double>(S(k));
         bias_est_                 = smoother_->calculateEstimate<double>(B(k));
+
+        // Grow the drift budget by the leg just flown. Measured on the graph's
+        // own optimized positions — the same quantity the gate is testing — and
+        // reset to 0 by applyAbsoluteFix() when a fix is accepted.
+        setDistanceSinceFix(dist_since_fix_m_ +
+                            (T_enu_c_last_kf_.translation() - p_prev_kf).norm());
 
         T_wc_last_kf_        = T_wc;
         last_kf_frame_id_    = item.res.frame_id;
@@ -519,8 +617,9 @@ private:
         saw_non_tracking_since_kf_ = false;
         ++keyframe_count_;
 
-        kf_registry_.push_back({k, item.res.frame_id});
+        kf_registry_.push_back({k, item.res.frame_id, item.res.timestamp_msec});
         rebuildLagWindow();
+        refreshCovarianceAndHealth(k);
 
         if (reinit_boundary) {
             spdlog::info("FusionModule: post-reinit boundary at X({}) (frame {}) — "
@@ -531,6 +630,267 @@ private:
         spdlog::debug("FusionModule: keyframe X({}) inserted (frame {}, s={:.4f}, "
                       "b={:.2f} m, {} KFs in graph history)",
                       k, item.res.frame_id, scale_est_, bias_est_, keyframe_count_);
+    }
+
+    // ── Absolute-fix intake (consumer side) ───────────────────────────────
+
+    //! Symmetric-positive-definite check on a fix covariance: gtsam's
+    //! Gaussian::Covariance() and the gate's solve both require it.
+    static bool isUsableCovariance(const Eigen::Matrix2d& cov) {
+        if (!cov.allFinite()) {
+            return false;
+        }
+        const Eigen::LDLT<Eigen::Matrix2d> ldlt(cov);
+        return ldlt.info() == Eigen::Success && ldlt.isPositive() &&
+               cov(0, 0) > 0.0 && cov(1, 1) > 0.0;
+    }
+
+    //! Noise model for an accepted fix: the measurement covariance, optionally
+    //! wrapped in a robust kernel. With fix_gate_enabled the Mahalanobis gate
+    //! has already run at this point and the kernel only shapes the influence
+    //! of measurements that were admitted; with the gate off (the default) the
+    //! kernel is the ONLY thing standing between a bad residual and the graph —
+    //! which is why the default kernel is Huber and not the redescending Tukey
+    //! (see FusionConfig::fix_robust_kernel).
+    gtsam::SharedNoiseModel makeFixNoiseModel(const Eigen::Matrix2d& cov) const {
+        const auto base = gtsam::noiseModel::Gaussian::Covariance(cov);
+        switch (config_.fix_robust_kernel) {
+            case FixRobustKernel::HUBER:
+                return gtsam::noiseModel::Robust::Create(
+                    gtsam::noiseModel::mEstimator::Huber::Create(config_.huber_k),
+                    base);
+            case FixRobustKernel::TUKEY:
+                return gtsam::noiseModel::Robust::Create(
+                    gtsam::noiseModel::mEstimator::Tukey::Create(config_.fix_tukey_c),
+                    base);
+            case FixRobustKernel::NONE:
+                break;
+        }
+        return base;
+    }
+
+    //! Drain the fix queue and append the surviving AbsoluteXYFactors to
+    //! `graph` — the SAME graph the caller is about to hand to
+    //! smoother_->update(), so an accepted fix takes effect in the very
+    //! update of the keyframe that consumed it. Process()-thread only.
+    void consumeAbsoluteFixes(gtsam::NonlinearFactorGraph& graph, double now_sec) {
+        std::vector<anchor::AbsoluteFix> fixes;
+        {
+            std::lock_guard<std::mutex> lock(mtx_fix_);
+            if (fix_queue_.empty()) {
+                return;  // fast path: nothing to do, graph untouched
+            }
+            fixes.assign(fix_queue_.begin(), fix_queue_.end());
+            fix_queue_.clear();
+        }
+        for (const auto& fix : fixes) {
+            applyAbsoluteFix(graph, fix, now_sec);
+        }
+    }
+
+    //! Match one fix to a live keyframe state, gate it, and (if accepted) add
+    //! the factor. `now_sec` is the timestamp of the keyframe driving this
+    //! update.
+    //!
+    //! Candidates are the keyframes ALREADY in the smoother (kf_registry_,
+    //! self-pruned on marginalization) — not the keyframe currently being
+    //! inserted, whose marginal covariance does not exist yet and which could
+    //! therefore only be gated on cov_fix alone.
+    //!
+    //! The timestamp of the matched key is deliberately NOT refreshed:
+    //! re-stamping would extend that key's lifetime inside the fixed-lag
+    //! window as a side effect of receiving a fix.
+    void applyAbsoluteFix(gtsam::NonlinearFactorGraph& graph,
+                          const anchor::AbsoluteFix& fix, double now_sec) {
+        // Producer-side quality filter FIRST: it is the only rejection stage
+        // that does not consult the estimate the fix is meant to correct, so it
+        // cannot participate in a self-feeding drift loop (see
+        // FusionConfig::fix_min_confidence / fix_gate_enabled).
+        //
+        // Stage 3 of the three-stage absolute-measurement trace
+        // (anchor[REQ] → anchor[EMIT] → anchor[APPLY]), at `info`: EVERY fix
+        // that enters here leaves exactly one anchor[APPLY] line carrying its
+        // outcome, so no measurement can disappear without a trace. The
+        // correlation key across the three stages is `ts` (= the timestamp of
+        // the query the fix was made from); `kf_frame` is the frame of the
+        // keyframe the fix was ATTACHED to, and `dt_match` how far that
+        // keyframe sits from the fix — dt_match > 0 means the fix landed on a
+        // keyframe OTHER than the frame that requested it.
+        if (fix.confidence < config_.fix_min_confidence) {
+            fix_low_confidence_.fetch_add(1, std::memory_order_relaxed);
+            spdlog::info("anchor[APPLY] result=LOW_CONFIDENCE ts={:.1f} "
+                         "kf_frame=n/a confidence={:.3f} < {:.3f}",
+                         fix.timestamp_msec, fix.confidence,
+                         config_.fix_min_confidence);
+            return;
+        }
+
+        const double fix_sec = fix.timestamp_msec * MSEC_TO_SEC;
+        const double age_budget_sec = fixAgeBudgetSec();
+        if (now_sec - fix_sec > age_budget_sec) {
+            fix_age_expired_.fetch_add(1, std::memory_order_relaxed);
+            spdlog::info("anchor[APPLY] result=AGE_EXPIRED ts={:.1f} "
+                         "kf_frame=n/a age={:.1f} ms > budget {:.1f} ms",
+                         fix.timestamp_msec, (now_sec - fix_sec) / MSEC_TO_SEC,
+                         age_budget_sec / MSEC_TO_SEC);
+            return;
+        }
+
+        const KeyframeEntry* best = nullptr;
+        double               best_dt = 0.0;
+        for (const auto& entry : kf_registry_) {
+            const double dt = std::abs(entry.timestamp_msec * MSEC_TO_SEC - fix_sec);
+            if (best == nullptr || dt < best_dt) {
+                best    = &entry;
+                best_dt = dt;
+            }
+        }
+        if (best == nullptr || best_dt > config_.fix_match_tolerance_sec) {
+            fix_unmatched_.fetch_add(1, std::memory_order_relaxed);
+            spdlog::info("anchor[APPLY] result=UNMATCHED ts={:.1f} kf_frame=n/a "
+                         "nearest_kf={} dt_match={:.1f} ms > tol {:.1f} ms "
+                         "(live keyframes={})",
+                         fix.timestamp_msec,
+                         best != nullptr ? static_cast<long long>(best->frame_id)
+                                         : -1,
+                         best_dt / MSEC_TO_SEC,
+                         config_.fix_match_tolerance_sec / MSEC_TO_SEC,
+                         kf_registry_.size());
+            return;
+        }
+        const unsigned int k_match = best->k;
+        const unsigned int kf_frame = best->frame_id;
+        const gtsam::Key   key     = X(k_match);
+
+        gtsam::Pose3 pose_pred;
+        try {
+            pose_pred = smoother_->calculateEstimate<gtsam::Pose3>(key);
+        } catch (const std::exception& e) {
+            fix_marginalized_.fetch_add(1, std::memory_order_relaxed);
+            spdlog::info("anchor[APPLY] result=MARGINALIZED ts={:.1f} "
+                         "kf_frame={} X({}) dt_match={:.1f} ms — no longer in "
+                         "the smoother ({})",
+                         fix.timestamp_msec, kf_frame, k_match,
+                         best_dt / MSEC_TO_SEC, e.what());
+            return;
+        }
+
+        const Eigen::Vector2d r(pose_pred.translation().x() - fix.xy_enu.x(),
+                                pose_pred.translation().y() - fix.xy_enu.y());
+
+        // ── Mahalanobis gate (OPT-IN, FusionConfig::fix_gate_enabled) ────────
+        //
+        // Gate covariance S = cov_fix + cov_pred + (rho·s)²·I.
+        //
+        // cov_pred grows with the VO drift, which is what keeps a CORRECT fix
+        // admissible after the estimate has wandered far (a cov_fix-only gate
+        // would reject exactly the measurement the estimator needs most — see
+        // FusionConfig). The third term repairs what cov_pred gets WRONG: the
+        // graph models VO error as independent noise (√n) while the real drift
+        // is systematic (n), so cov_pred alone was measured ~118× too tight on
+        // YenBai (.docs/reports/m1_fake_anchor.md §6.2). rho is a MEASURED
+        // per-dataset drift rate supplied by the config (0 ⇒ term disabled and
+        // the gate is byte-identical to M1), s is the distance flown since the
+        // last APPLIED fix.
+        //
+        // The whole test is self-referential — it asks the estimate whether the
+        // measurement that should correct it is plausible — and measurement
+        // showed that this closes a positive-feedback loop (FusionConfig). It
+        // is kept, off by default, so the M1 numbers stay reproducible.
+        double d2            = 0.0;
+        double drift_sigma_m = 0.0;
+        if (config_.fix_gate_enabled) {
+            Eigen::Matrix2d S = fix.cov;
+            {
+                Eigen::Matrix2d cov_pred;
+                std::string     err;
+                if (marginalXyCovarianceEnu(key, pose_pred.rotation().matrix(),
+                                            cov_pred, err)) {
+                    S += cov_pred;
+                } else {
+                    warnCovarianceFallbackOnce(k_match, err.c_str());
+                }
+            }
+            if (config_.fix_drift_rate_m_per_m > 0.0) {
+                drift_sigma_m = config_.fix_drift_rate_m_per_m * dist_since_fix_m_;
+                S += (drift_sigma_m * drift_sigma_m) * Eigen::Matrix2d::Identity();
+            }
+
+            d2 = r.dot(S.ldlt().solve(r));
+            if (!(d2 <= config_.fix_gate_chi2)) {
+                // Gate radius ALONG this residual direction: the residual
+                // rescaled to where it would have sat exactly on the
+                // chi-square threshold.
+                const double radius_m =
+                    (d2 > 0.0) ? r.norm() * std::sqrt(config_.fix_gate_chi2 / d2) : 0.0;
+                fix_gated_.fetch_add(1, std::memory_order_relaxed);
+                fix_last_gated_residual_m_.store(r.norm(), std::memory_order_relaxed);
+                fix_last_gated_radius_m_.store(radius_m, std::memory_order_relaxed);
+                spdlog::info("anchor[APPLY] result=GATED ts={:.1f} kf_frame={} "
+                             "X({}) dt_match={:.1f} ms age={:.1f}/{:.1f} ms "
+                             "residual={:.1f} m d²={:.2f} > {:.2f} "
+                             "(gate radius {:.1f} m, drift sigma {:.1f} m over "
+                             "s={:.1f} m)",
+                             fix.timestamp_msec, kf_frame, k_match,
+                             best_dt / MSEC_TO_SEC,
+                             (now_sec - fix_sec) / MSEC_TO_SEC,
+                             age_budget_sec / MSEC_TO_SEC, r.norm(), d2,
+                             config_.fix_gate_chi2, radius_m, drift_sigma_m,
+                             dist_since_fix_m_);
+                return;
+            }
+        }
+
+        graph.emplace_shared<AbsoluteXYFactor>(key, fix.xy_enu,
+                                               makeFixNoiseModel(fix.cov));
+        fix_applied_.fetch_add(1, std::memory_order_relaxed);
+        // d² and the drift sigma are only meaningful when the gate ran; say so
+        // instead of printing a 0 that reads like a measured value.
+        //
+        // `age` is the budget figure asked of the lag window: how far back the
+        // smoother had to reach for this fix, against what the window allows.
+        spdlog::info("anchor[APPLY] result=APPLIED ts={:.1f} kf_frame={} X({}) "
+                     "dt_match={:.1f} ms age={:.1f}/{:.1f} ms residual={:.1f} m "
+                     "gate={} (d²={:.2f}, drift sigma {:.1f} m over s={:.1f} m)",
+                     fix.timestamp_msec, kf_frame, k_match,
+                     best_dt / MSEC_TO_SEC, (now_sec - fix_sec) / MSEC_TO_SEC,
+                     age_budget_sec / MSEC_TO_SEC, r.norm(),
+                     config_.fix_gate_enabled ? "on" : "off", d2, drift_sigma_m,
+                     dist_since_fix_m_);
+        // The drift budget restarts at an ACCEPTED fix only: a gated, expired
+        // or unmatched fix leaves the estimate exactly as uncertain as it was.
+        setDistanceSinceFix(0.0);
+    }
+
+    //! Age budget of a fix [s]: the whole lag window minus a safety margin —
+    //! the window IS how far back the smoother can still correct, and the
+    //! margin keeps a fix from landing on a state that marginalizes during this
+    //! very update (kcb_slam: last_stamp − lag_window + 0.5). Clamped at 0 so a
+    //! misconfigured margin can only reject, never admit everything.
+    double fixAgeBudgetSec() const {
+        return std::max(0.0, config_.lag_seconds - config_.fix_age_margin_sec);
+    }
+
+    //! Single writer of the flown-distance state (process() thread); keeps the
+    //! atomic mirror that fix_stats() publishes in step with it.
+    void setDistanceSinceFix(double meters) {
+        dist_since_fix_m_ = meters;
+        fix_distance_since_m_.store(meters, std::memory_order_relaxed);
+    }
+
+    //! Rate-limited (once per module lifetime) warning for the degraded gate:
+    //! when the marginal covariance is unavailable the gate falls back to the
+    //! fix covariance alone, which is conservative (it rejects more).
+    void warnCovarianceFallbackOnce(unsigned int k, const char* what) {
+        if (warned_cov_fallback_) {
+            spdlog::debug("FusionModule: marginalCovariance(X({})) failed again "
+                          "({}) — gate still on cov_fix only", k, what);
+            return;
+        }
+        warned_cov_fallback_ = true;
+        spdlog::warn("FusionModule: marginalCovariance(X({})) failed ({}) — "
+                     "absolute-fix gate falls back to the fix covariance alone "
+                     "(this warning is not repeated)", k, what);
     }
 
     //! Rebuild the lag-window snapshot after a successful smoother update.
@@ -564,11 +924,97 @@ private:
         lag_window_ = std::move(window);
     }
 
-    FusionHealth currentHealth() const {
-        if (keyframe_count_ >= HEALTH_CONVERGED_MIN_KEYFRAMES) {
-            return FusionHealth::CONVERGED;
+    // ── Marginal covariance + health (S7) ─────────────────────────────────
+
+    //! ENU horizontal (East/North) marginal covariance of the pose state
+    //! `key` [m²]. The Pose3 translation block gtsam returns is expressed in
+    //! the LOCAL (camera) frame — Pose3::retract translates by R·v — so it is
+    //! rotated into ENU with the pose's own rotation before the E/N corner is
+    //! taken. Returns false and fills `err` when the smoother cannot produce a
+    //! usable covariance; `out` is then left untouched.
+    //!
+    //! Single source of this computation: both the absolute-fix gate and the
+    //! per-keyframe accuracy figure go through it.
+    bool marginalXyCovarianceEnu(gtsam::Key key, const Eigen::Matrix3d& R_enu_c,
+                                 Eigen::Matrix2d& out, std::string& err) const {
+        try {
+            const gtsam::Matrix   cov = smoother_->marginalCovariance(key);
+            const Eigen::Matrix3d cov_t_local =
+                cov.block<3, 3>(POSE3_TANGENT_TRANS_INDEX, POSE3_TANGENT_TRANS_INDEX);
+            const Eigen::Matrix3d cov_t_enu =
+                R_enu_c * cov_t_local * R_enu_c.transpose();
+            const Eigen::Matrix2d xy = cov_t_enu.topLeftCorner<2, 2>();
+            if (!xy.allFinite()) {
+                err = "non-finite marginal covariance";
+                return false;
+            }
+            out = xy;
+            return true;
+        } catch (const std::exception& e) {
+            // Covers gtsam::IndeterminantLinearSystemException (a
+            // ThreadsafeException, hence a std::exception) and everything else
+            // the elimination can throw.
+            err = e.what();
+            return false;
         }
-        return FusionHealth::INITIALIZING;
+    }
+
+    //! Called right after every smoother update: refresh the horizontal
+    //! covariance of the freshly optimized keyframe state X(k) and step the
+    //! health state machine with it.
+    void refreshCovarianceAndHealth(unsigned int k) {
+        Eigen::Matrix2d cov;
+        std::string     err;
+        if (marginalXyCovarianceEnu(X(k), T_enu_c_last_kf_.linear(), cov, err)) {
+            xy_cov_last_kf_ = cov;
+            xy_cov_valid_   = true;
+        } else {
+            // The PREVIOUS keyframe's covariance is deliberately dropped:
+            // publishing a stale (and smaller) uncertainty as if it were
+            // current is worse than publishing none at all.
+            xy_cov_last_kf_.setZero();
+            xy_cov_valid_ = false;
+            warnStateCovarianceOnce(k, err.c_str());
+        }
+
+        const double sigma = horizontal_accuracy_m(xy_cov_last_kf_, xy_cov_valid_);
+        const FusionHealth prev = health_;
+        health_ = next_fusion_health(health_, sigma, xy_cov_valid_,
+                                     config_.health_converged_sigma_m,
+                                     config_.health_drifting_sigma_m);
+        if (health_ != prev) {
+            spdlog::info("FusionModule: health {} → {} at X({}) "
+                         "(sigma_xy={:.2f} m, thresholds {:.2f}/{:.2f} m)",
+                         healthName(prev), healthName(health_), k, sigma,
+                         config_.health_converged_sigma_m,
+                         config_.health_drifting_sigma_m);
+        }
+        spdlog::debug("FusionModule: X({}) sigma_xy={:.3f} m (health {})",
+                      k, sigma, healthName(health_));
+    }
+
+    static const char* healthName(FusionHealth h) {
+        switch (h) {
+            case FusionHealth::INITIALIZING: return "INITIALIZING";
+            case FusionHealth::CONVERGED:    return "CONVERGED";
+            case FusionHealth::DRIFTING:     return "DRIFTING";
+        }
+        return "?";
+    }
+
+    //! Rate-limited (once per module lifetime) warning for a missing STATE
+    //! covariance: FusionResult::covariance_valid then goes false and
+    //! accuracy_m becomes NaN downstream — never 0.
+    void warnStateCovarianceOnce(unsigned int k, const char* what) {
+        if (warned_state_cov_) {
+            spdlog::debug("FusionModule: marginalCovariance(X({})) failed again "
+                          "({}) — accuracy reported as unavailable", k, what);
+            return;
+        }
+        warned_state_cov_ = true;
+        spdlog::warn("FusionModule: marginalCovariance(X({})) failed ({}) — "
+                     "FusionResult carries no covariance and accuracy_m is NaN "
+                     "(this warning is not repeated)", k, what);
     }
 
     //! Store the newest result and fire the callbacks in registration order
@@ -617,13 +1063,42 @@ private:
     struct KeyframeEntry {
         unsigned int k        = 0;
         unsigned int frame_id = 0;
+        //! Source-frame timestamp — the key an absolute fix is matched on.
+        double       timestamp_msec = 0.0;
     };
     std::vector<KeyframeEntry> kf_registry_;
+
+    // Absolute-fix intake. Separate from queue_ and drop-oldest: fixes are
+    // optional evidence, keyframes are not.
+    std::deque<anchor::AbsoluteFix> fix_queue_;
+    mutable std::mutex              mtx_fix_;
+    std::atomic<unsigned long long> fix_injected_{0};
+    std::atomic<unsigned long long> fix_applied_{0};
+    std::atomic<unsigned long long> fix_gated_{0};
+    std::atomic<unsigned long long> fix_low_confidence_{0};
+    // One counter per drop reason — see FusionFixStats: M1 merged three of
+    // these and the 84 % rejection rate went unnoticed for a whole milestone.
+    std::atomic<unsigned long long> fix_age_expired_{0};
+    std::atomic<unsigned long long> fix_unmatched_{0};
+    std::atomic<unsigned long long> fix_marginalized_{0};
+    std::atomic<unsigned long long> fix_queue_dropped_{0};
+    std::atomic<unsigned long long> fix_no_graph_{0};
+    //! Publication mirrors of the gate observables (written by process(), read
+    //! by fix_stats() from any thread).
+    std::atomic<double> fix_distance_since_m_{0.0};
+    std::atomic<double> fix_last_gated_residual_m_{0.0};
+    std::atomic<double> fix_last_gated_radius_m_{0.0};
+    //! Rate-limit flag for the degraded-gate warning (process() thread only).
+    bool warned_cov_fallback_ = false;
+    //! Rate-limit flag for the missing-state-covariance warning (same thread).
+    bool warned_state_cov_ = false;
 
     // Graph state — touched only by process() (single consumer: the fusion
     // thread in async mode, the caller's thread in sync mode).
     std::unique_ptr<gtsam::IncrementalFixedLagSmoother> smoother_;
-    bool              initialized_    = false;
+    //! Atomic: written once by process(), read by push_absolute_fix() from
+    //! the producer thread (a fix that predates the anchor has no frame).
+    std::atomic<bool> initialized_{false};
     unsigned int      next_key_       = 0;  //!< index k of the next X(k)
     unsigned int      keyframe_count_ = 0;
     unsigned int      last_kf_frame_id_ = 0;
@@ -634,6 +1109,22 @@ private:
     // Latest auxiliary-state estimates (read back after every smoother update).
     double scale_est_     = 1.0;  //!< s(k_last)
     double bias_est_      = 0.0;  //!< b(k_last)
+
+    //! Distance flown [m] since the last APPLIED absolute fix (since graph
+    //! initialization while no fix has been applied yet) — the `s` of the
+    //! drift term of the fix gate. Accumulated over the OPTIMIZED keyframe
+    //! positions (the graph's own trajectory), so it needs no extra input and
+    //! stays consistent with the state the gate is testing. process() thread
+    //! only; mirrored into fix_distance_since_m_ for publication.
+    double dist_since_fix_m_ = 0.0;
+
+    //! ENU horizontal covariance of X(k_last) and its validity, refreshed at
+    //! every smoother update by refreshCovarianceAndHealth(). Zero + false
+    //! before the graph is anchored (and after a failed marginalization).
+    Eigen::Matrix2d xy_cov_last_kf_ = Eigen::Matrix2d::Zero();
+    bool            xy_cov_valid_   = false;
+    //! Health state — advanced only by refreshCovarianceAndHealth().
+    FusionHealth    health_         = FusionHealth::INITIALIZING;
 
     // Telemetry azimuth at the last keyframe (delta-yaw factor endpoints).
     double last_kf_psi_rad_     = 0.0;
@@ -662,6 +1153,14 @@ void FusionModule::stop() {
 
 void FusionModule::push(const vo::VOResult& res, const sensor::TelemetryData& telem) {
     impl_->push(res, telem);
+}
+
+void FusionModule::push_absolute_fix(const anchor::AbsoluteFix& fix) {
+    impl_->push_absolute_fix(fix);
+}
+
+FusionFixStats FusionModule::fix_stats() const {
+    return impl_->fix_stats();
 }
 
 void FusionModule::add_result_callback(std::function<void(const FusionResult&)> cb) {

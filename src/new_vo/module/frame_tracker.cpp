@@ -6,6 +6,7 @@
 #include "uavloc/new_vo/match/robust.h"
 #include "uavloc/new_vo/module/frame_tracker.h"
 #include "uavloc/new_vo/optimize/pose_optimizer_g2o.h"
+#include "uavloc/util/scoped_timer.h"
 
 #include <spdlog/spdlog.h>
 
@@ -27,11 +28,16 @@ bool FrameTracker::motion_based_track(data::Frame& curr_frm, const data::Frame& 
     curr_frm.erase_landmarks();
 
     // Reproject the 3D points observed in the last Frame and find 2D-3D matches
-    auto num_matches = projection_matcher.match_current_and_last_frames(curr_frm, last_frm, margin_);
+    unsigned int num_matches = 0;
+    {
+        util::ScopedTimer _t(util::ProfileStage::TRACK_MATCH);
+        num_matches = projection_matcher.match_current_and_last_frames(curr_frm, last_frm, margin_);
+    }
 
     if (num_matches < num_matches_thr_) {
         // Increment the margin, and search again
         curr_frm.erase_landmarks();
+        util::ScopedTimer _t(util::ProfileStage::TRACK_MATCH);
         num_matches = projection_matcher.match_current_and_last_frames(curr_frm, last_frm, 2 * margin_);
     }
 
@@ -43,7 +49,10 @@ bool FrameTracker::motion_based_track(data::Frame& curr_frm, const data::Frame& 
     // Pose optimization
     Mat44_t optimized_pose;
     std::vector<bool> outlier_flags;
-    pose_optimizer_->optimize(curr_frm, optimized_pose, outlier_flags);
+    {
+        util::ScopedTimer _t(util::ProfileStage::TRACK_POSE_OPT);
+        pose_optimizer_->optimize(curr_frm, optimized_pose, outlier_flags);
+    }
     curr_frm.set_pose_cw(optimized_pose);
 
     // Discard the outliers
@@ -64,7 +73,11 @@ bool FrameTracker::robust_match_based_track(data::Frame& curr_frm, const data::F
     // Search 2D-2D matches between the ref keyframes and the current Frame
     // to acquire 2D-3D matches between the Frame keypoints and 3D points observed in the ref Keyframe
     std::vector<std::shared_ptr<data::Landmark>> matched_lms_in_curr;
-    auto num_matches = robust_matcher.match_frame_and_keyframe(curr_frm, ref_keyfrm, matched_lms_in_curr, use_fixed_seed_);
+    unsigned int num_matches = 0;
+    {
+        util::ScopedTimer _t(util::ProfileStage::TRACK_MATCH);
+        num_matches = robust_matcher.match_frame_and_keyframe(curr_frm, ref_keyfrm, matched_lms_in_curr, use_fixed_seed_);
+    }
 
     if (num_matches < num_matches_thr_) {
         spdlog::debug("robust match based tracking failed: {} matches < {}", num_matches, num_matches_thr_);
@@ -79,7 +92,10 @@ bool FrameTracker::robust_match_based_track(data::Frame& curr_frm, const data::F
     curr_frm.set_pose_cw(last_frm.get_pose_cw());
     Mat44_t optimized_pose;
     std::vector<bool> outlier_flags;
-    pose_optimizer_->optimize(curr_frm, optimized_pose, outlier_flags);
+    {
+        util::ScopedTimer _t(util::ProfileStage::TRACK_POSE_OPT);
+        pose_optimizer_->optimize(curr_frm, optimized_pose, outlier_flags);
+    }
     curr_frm.set_pose_cw(optimized_pose);
 
     // Discard the outliers

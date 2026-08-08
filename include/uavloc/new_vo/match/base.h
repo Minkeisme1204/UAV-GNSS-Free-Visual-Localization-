@@ -4,6 +4,7 @@
 
 #include <array>
 #include <algorithm>
+#include <cstdint>
 #include <numeric>
 
 #include <opencv2/core/mat.hpp>
@@ -16,17 +17,16 @@ static constexpr unsigned int HAMMING_DIST_THR_LOW = 50;
 static constexpr unsigned int HAMMING_DIST_THR_HIGH = 100;
 static constexpr unsigned int MAX_HAMMING_DIST = 256;
 
-//! ORB特徴量間のハミング距離を計算する
-inline unsigned int compute_descriptor_distance_32(const cv::Mat& desc_1, const cv::Mat& desc_2) {
+//! ORB特徴量間のハミング距離を計算する (raw descriptor rows, 8 x uint32_t each).
+//! Hot-loop overload: lets a caller hoist the cv::Mat header construction of
+//! Mat::row() out of the inner loop and keep only the pointer arithmetic.
+inline unsigned int compute_descriptor_distance_32(const uint32_t* pa, const uint32_t* pb) {
     // http://graphics.stanford.edu/~seander/bithacks.html#CountBitsSetParallel
 
     constexpr uint32_t mask_1 = 0x55555555U;
     constexpr uint32_t mask_2 = 0x33333333U;
     constexpr uint32_t mask_3 = 0x0F0F0F0FU;
     constexpr uint32_t mask_4 = 0x01010101U;
-
-    const auto* pa = desc_1.ptr<uint32_t>();
-    const auto* pb = desc_2.ptr<uint32_t>();
 
     unsigned int dist = 0;
 
@@ -38,6 +38,11 @@ inline unsigned int compute_descriptor_distance_32(const cv::Mat& desc_1, const 
     }
 
     return dist;
+}
+
+//! ORB特徴量間のハミング距離を計算する
+inline unsigned int compute_descriptor_distance_32(const cv::Mat& desc_1, const cv::Mat& desc_2) {
+    return compute_descriptor_distance_32(desc_1.ptr<uint32_t>(), desc_2.ptr<uint32_t>());
 }
 
 //! ORB特徴量間のハミング距離を計算する

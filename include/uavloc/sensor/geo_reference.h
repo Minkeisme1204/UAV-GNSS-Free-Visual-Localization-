@@ -64,6 +64,19 @@ public:
                                alt - alt0_);
     }
 
+    // Pure inverse of enu(): ENU metres (relative to the anchor) -> lat/lon/alt.
+    // Use this for a position that is ALREADY in the ENU frame — e.g.
+    // fusion::FusionResult::T_enu_c, whose translation the back-end produced in
+    // ENU directly. It does NOT apply R_enu_w, unlike latlon(), which expects a
+    // position in the VO world frame and would rotate an ENU input a second time.
+    LatLonAlt latlon_from_enu(const Eigen::Vector3d& p_enu) const {
+        LatLonAlt out;
+        out.lon = lon0_ + p_enu.x() / m_per_deg_lon_;
+        out.lat = lat0_ + p_enu.y() / METERS_PER_DEG_LAT;
+        out.alt = alt0_ + p_enu.z();
+        return out;
+    }
+
     // Inverse: a VO world position -> geographic latitude / longitude / altitude.
     LatLonAlt latlon(const Eigen::Vector3d& pos_vo) const {
         const Eigen::Vector3d p_enu = R_enu_w_ * pos_vo;  // E, N, U in metres

@@ -4,6 +4,7 @@
 target_sources(uavloc PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/angle.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/random_array.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/scoped_timer.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/sys_monitor.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/yaml.cpp
     # NOTE: converter.cpp (util::Converter) uses g2o's SE3Quat; the g2o include

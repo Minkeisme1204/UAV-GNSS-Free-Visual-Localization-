@@ -39,6 +39,21 @@ public:
                                           bool use_fixed_seed = false) const;
 
     unsigned int brute_force_match(const data::FrameObservation& frm_obs, const std::shared_ptr<data::Keyframe>& keyfrm, std::vector<std::pair<int, int>>& matches) const;
+
+private:
+    //! Body of match_for_triangulation(). When use_grid is true the candidate
+    //! keypoints of Keyframe 2 are narrowed to the cells of the acceleration
+    //! grid that can possibly satisfy the epipolar constraint; when it is false
+    //! every keypoint is visited (the exhaustive reference path). Both paths run
+    //! the identical inner loop over an ascending list of candidate indices, so
+    //! they are required to return bit-identical results — see the
+    //! UAVLOC_MATCH_VERIFY self-check in match_for_triangulation().
+    unsigned int match_for_triangulation_impl(const std::shared_ptr<data::Keyframe>& keyfrm_1,
+                                              const std::shared_ptr<data::Keyframe>& keyfrm_2,
+                                              const Mat33_t& E_12,
+                                              std::vector<std::pair<unsigned int, unsigned int>>& matched_idx_pairs,
+                                              const float residual_rad_thr,
+                                              const bool use_grid) const;
 };
 
 } // namespace match

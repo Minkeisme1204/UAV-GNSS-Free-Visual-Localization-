@@ -69,13 +69,16 @@ option(BUILD_TESTING "Build test programs" ON)
 # ORB uses a scalar rotation path by default; the SSE3 fast path is opt-in and
 # requires an SSE3-capable x86 host (see feature/orb/orb_impl.cpp).
 option(USE_SSE_ORB "Enable the SSE3 fast path in the ORB extractor" OFF)
+# debug_viewer is a module OF libuavloc (see CLAUDE.md "CMake Hierarchy", R4 as
+# revised 2026-08-08). ON is the development default; every deployment build
+# (apps/, the on-UAV machine) MUST configure with -DENABLE_VIEWER=OFF so that no
+# GL/GLFW/zbar dependency reaches the flight binary.
+option(ENABLE_VIEWER "Build the debug viewer into libuavloc" ON)
 
 # ── Library ───────────────────────────────────────────────────────────────────
+# src/CMakeLists.txt owns the module list, debug_viewer included — never
+# add_subdirectory a module from the root (see .claude/rules/cmake.md).
 add_subdirectory(src)
-
-if(Iridescence_FOUND)
-    add_subdirectory(src/debug_viewer)
-endif()
 
 # ── Tests ─────────────────────────────────────────────────────────────────────
 if(BUILD_TESTING)

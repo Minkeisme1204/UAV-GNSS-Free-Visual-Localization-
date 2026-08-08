@@ -5,7 +5,8 @@
 // must not leak into the public uavloc API.
 //
 // Formulations follow .docs/theory/heading_agl_prior_tactics.md §5.3/§6 and
-// the kcb_slam ScaledVOFactor precedent (kcb docs/05_khoi_fusion.md §3.1):
+// the kcb_slam ScaledVOFactor precedent
+// (.docs/related_work/kcb_slam/05_khoi_fusion.md §3.1):
 // pure error functions + gtsam::numericalDerivative Jacobians.
 
 #include <gtsam/base/numericalDerivative.h>
@@ -254,6 +255,51 @@ public:
 
 private:
     double measured_agl_m_;
+};
+
+// ── AbsoluteXYFactor ─────────────────────────────────────────────────────────
+
+//! Absolute horizontal position unary on X(k) — the back-end's entry point for
+//! anchor::AbsoluteFix (M1: fake fixes from groundtruth, later: VPR).
+//!   error(2) = [ x(X_k) - meas_x , y(X_k) - meas_y ]
+//!
+//! Two dimensions ONLY: Z is already measured by AglFactor (stacking a third
+//! row here would double-count the altitude evidence and make the two sources
+//! impossible to ablate separately), and no rotation row is added — absolute
+//! yaw stays unconstrained in M1 by design, so any yaw self-correction seen in
+//! the results is genuinely produced by the position measurements alone.
+//!
+//! gtsam::GPSFactor is deliberately not reused: it constrains all three axes,
+//! and neutralising its Z row with a huge sigma would silently overlap
+//! AglFactor.
+class AbsoluteXYFactor : public gtsam::NoiseModelFactor1<gtsam::Pose3> {
+public:
+    AbsoluteXYFactor(gtsam::Key pose, const Eigen::Vector2d& measured_xy_enu,
+                     const gtsam::SharedNoiseModel& model)
+        : gtsam::NoiseModelFactor1<gtsam::Pose3>(model, pose),
+          measured_xy_enu_(measured_xy_enu) {}
+
+    //! Pure error function (separate so numericalDerivative can use it).
+    gtsam::Vector error_function(const gtsam::Pose3& p) const {
+        return gtsam::Vector2(p.translation().x() - measured_xy_enu_.x(),
+                              p.translation().y() - measured_xy_enu_.y());
+    }
+
+    gtsam::Vector evaluateError(const gtsam::Pose3& p,
+                                gtsam::Matrix* H1 = nullptr) const override {
+        const std::function<gtsam::Vector(const gtsam::Pose3&)> fn =
+            [this](const gtsam::Pose3& a) { return error_function(a); };
+        if (H1) {
+            *H1 = gtsam::numericalDerivative11<gtsam::Vector, gtsam::Pose3>(
+                fn, p, NUMERICAL_JACOBIAN_STEP);
+        }
+        return error_function(p);
+    }
+
+    const Eigen::Vector2d& measured() const { return measured_xy_enu_; }
+
+private:
+    Eigen::Vector2d measured_xy_enu_;  //!< (East, North) [m]
 };
 
 // ── MapDepthFactor ───────────────────────────────────────────────────────────

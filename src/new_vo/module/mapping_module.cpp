@@ -3,6 +3,7 @@
 #include "uavloc/new_vo/data/keyframe.h"
 #include "uavloc/new_vo/data/landmark.h"
 #include "uavloc/new_vo/vo_config.h"
+#include "uavloc/util/scoped_timer.h"
 
 #include <spdlog/spdlog.h>
 
@@ -187,6 +188,7 @@ void MappingModule::resume() {
 }
 
 void MappingModule::run() {
+    util::Profiler::set_thread_label("mapping");
     while (true) {
         QueueItem item;
         {
@@ -199,6 +201,7 @@ void MappingModule::run() {
                     is_paused_ = true;
                     pause_cv_.notify_all();
                 }
+                util::ScopedTimer _t(util::ProfileStage::MAP_QUEUE_WAIT);
                 cv_.wait(lock);
             }
             if (terminate_) {

@@ -1,194 +1,99 @@
-// test_vo_viewer — LIVE 3D viewer driver for the new_vo VOModule.
+// test_vo_viewer — WORKED EXAMPLE of how to drive uavloc, with a live 3D view.
 //
-// Mirrors the debug-viewer mechanism of the (deprecated) tests/test_vo_pipeline.cpp,
-// ported onto the new_vo public API (uavloc::vo::VOModule::process_frame + the
-// VOData publish callback):
+// Read this file as the reference assembly of the system. It does four things
+// and nothing else:
+//   1. load one mission YAML  → sensor::VideoReaderConfig + core::SystemConfig;
+//   2. build core::SystemManager and attach a push-style sensor::VideoDataSource
+//      (the source owns its reading thread; the manager owns the pipeline);
+//   3. decide the RUN-MODE POLICY (auto-start vs. wait for the Start button) —
+//      only the application knows whether anybody can press a button;
+//   4. hand the manager to debug_viewer::DebugViewer::attach() and let
+//      DebugViewer::run() own the main thread and the run, then report.
 //
-//   * The VO pipeline runs on a WORKER thread; DebugViewer::run() owns the MAIN
-//     thread (GL singleton, blocking live window). A shared std::atomic<bool>
-//     stop_requested coordinates shutdown: when the video ends the worker just
-//     logs and returns — the window STAYS OPEN with the full visualization until
-//     the user closes it; run() then returns and the main thread flags the
-//     worker (no-op if already finished) and the perf sampler, then joins both.
-//   * viewer.loadBatch({}) -> live push mode. Per processed frame the worker pushes
-//     the groundtruth pose (telemetry lat/lon/alt -> ENU via gps_to_enu.h) and,
-//     once a 4-DoF gravity-aligned (yaw + translation, roll/pitch locked by the
-//     landmark-plane normal) VO-world -> groundtruth-ENU transform is frozen over
-//     an initial alignment window of TRACKING frames, the aligned VO estimate
-//     (pushPose) and the latest keyframe map-point cloud (pushMapPoints). A free
-//     3-DoF-rotation Umeyama is degenerate here: the near-collinear camera window
-//     leaves the roll about the flight axis unconstrained, tilting the whole map.
-//   * Headless-safe: viewer.run() returns immediately with no DISPLAY. Everything
-//     is behind #ifdef UAVLOC_WITH_DEBUG_VIEWER; without it the pipeline just runs
-//     on the main thread to completion (or the UAVLOC_VO_MAXFRAMES cap) and exits 0.
-//   * Soft-skips (returns 0) when the gitignored dataset video is unavailable.
-//   * Side-panel parity with the old test_vo_pipeline: per-frame FrameMetrics
-//     (inliers/landmarks plots + HUD heading/distance), a "Tracking" sub-window
-//     overlaying VOResult::tracked_observations on the frame, LOST-pose markers,
-//     and a "Performance" panel fed by a /proc-based CPU%/RSS sampler thread.
+// ⚠ NO ABSOLUTE POSITION HERE. This driver runs VO + fusion + viewer only; no
+// anchor::AnchorInterface is attached, so the fused trajectory is pure dead
+// reckoning. For the whole-system flow WITH absolute fixes use the sibling
+// driver tests/test_vo_vpr_anchor_viewer.cpp.
+//
+// All display logic — the four channel callbacks, the 4-DoF alignment, the
+// display anchor, the overlays, the supervisor and the perf sampler — lives in
+// the viewer module, not here. Design + contracts:
+// `.docs/designs/viewer_module_design.md`.
+//
+// The target is only built with -DENABLE_VIEWER=ON (and Iridescence found), so
+// the viewer is ALWAYS present: this file carries no #ifdef and no headless
+// fallback path.
+//
+// ── No environment variables ────────────────────────────────────────────────
+// What this driver measures is fixed by named constants (the frame cap and the
+// dump path in tests/driver_common.h, the profiling switch below), so a run is
+// described completely by "this binary + this config". Only SPDLOG_LEVEL, which
+// belongs to the logging library and changes nothing that is measured, is still
+// honoured.
+//
+// ── The pose dump — the cross-driver regression gate ────────────────────────
+// The run ALWAYS writes one row per fused pose (`frame_id,pred_x,pred_y,pred_z`)
+// to eval::VIEWER_DUMP_PATH: the DISPLAY-anchored position g0 + (f - f0), i.e.
+// exactly what the viewer draws, taken from DebugViewer::FusedPoseSink.
+// tests/test_driver_parity.cpp compares that sequence with test_full_flight's;
+// the two differ by a CONSTANT (the display anchor), which is the property that
+// gate asserts.
+//
+// ── Start/Stop vs. auto-start, and the frame cap ────────────────────────────
+// Both come from eval::viewer_run_policy(), which answers one question — is
+// this a regression run or a visual session? Headless ⇒ the run starts by
+// itself (nobody could click) and stops at eval::PARITY_MAX_FRAMES. With a
+// DISPLAY ⇒ it waits for the viewer's Start button and is NOT capped: a cap
+// would end the session behind the operator's back and leave a Start button
+// that can no longer start anything.
+//
+// Soft-skips (returns 0) when the gitignored dataset video is unavailable.
 //
 // Usage (from build/):
 //     ./tests/test_vo_viewer [config.yaml]
-//     UAVLOC_VO_MAXFRAMES=200 ./tests/test_vo_viewer [config.yaml]   # capped run
 // Run with a DISPLAY to open the live window (trajectory + groundtruth + cloud).
-#include "uavloc/sensor/video_reader.h"
-#include "uavloc/new_vo/vo_config.h"
+#include "uavloc/core/system_config.h"
+#include "uavloc/core/system_manager.h"
+#include "uavloc/debug_viewer/debug_viewer.h"
 #include "uavloc/new_vo/vo_module.h"
-#include "uavloc/fusion/fusion_config.h"
-#include "uavloc/fusion/fusion_data.h"
-#include "uavloc/fusion/fusion_module.h"
+#include "uavloc/util/scoped_timer.h"
+
+#include "driver_common.h"
 
 #include <Eigen/Core>
 #include <spdlog/cfg/env.h>
 #include <spdlog/spdlog.h>
-#include <yaml-cpp/yaml.h>
 
-#include <algorithm>
 #include <atomic>
-#include <cstdlib>
+#include <cstddef>
+#include <fstream>
+#include <memory>
 #include <string>
-#include <vector>
 
-#ifdef UAVLOC_WITH_DEBUG_VIEWER
-#include "uavloc/debug_viewer/debug_viewer.h"
-#include "uavloc/debug_viewer/inferred_pose.h"
-#include "uavloc/debug_viewer/viewer_metrics.h"
-#include "uavloc/util/sys_monitor.h"
-#include "gps_to_enu.h"    // src/debug_viewer (on this target's include path)
-#include <Eigen/Geometry>  // Eigen::umeyama, Quaterniond, AngleAxisd
-#include <Eigen/SVD>       // JacobiSVD (landmark-plane fit)
-#include <opencv2/imgproc.hpp>
-#include <chrono>
-#include <cmath>
-#include <cstdint>
-#include <mutex>
-#include <thread>
-#include <tuple>
-#include <utility>
+#ifndef UAVLOC_MISSION_CONFIG_PATH
+#define UAVLOC_MISSION_CONFIG_PATH "config/uavloc_yenbai800m_newvo.yaml"   // fallback; CMake injects the real path
 #endif
 
 namespace uavloc {
 namespace {
 
-const std::string DEFAULT_CONFIG_PATH =
-    "/home/minkeisrtx5090/Desktop/Workplace/HUST/uav_localization/config/uavloc_yenbai800m.yaml";
+const std::string DEFAULT_CONFIG_PATH = UAVLOC_MISSION_CONFIG_PATH;
 
-// Maximum consecutive EMPTY_FRAME results tolerated before the reader is treated
-// as exhausted (some codecs over-report CAP_PROP_FRAME_COUNT).
-constexpr int MAX_CONSECUTIVE_EMPTY_FRAMES = 30;
+//! Prefix of this driver's log lines (and of the shared helpers' lines).
+constexpr const char* DRIVER_NAME = "test_vo_viewer";
 
-#ifdef UAVLOC_WITH_DEBUG_VIEWER
-// ── HUD heading formula (mirrors the old test_vo_pipeline) ───────────────────
-// Degrees per full turn — used to wrap heading angles into [0, 360).
-constexpr double DEGREES_PER_TURN = 360.0;
-// Radians -> degrees for the course-over-ground heading.
-constexpr double DEG_PER_RAD = 180.0 / M_PI;
-
-// Wrap an angle in degrees into [0, 360).
-double wrap360(double deg) {
-    deg = std::fmod(deg, DEGREES_PER_TURN);
-    if (deg < 0.0) deg += DEGREES_PER_TURN;
-    return deg;
-}
-
-// Tracking-overlay presentation constants (debug-viewer sub-window only — NOT
-// pipeline thresholds): circle radius for a tracked landmark keypoint, and the
-// annotation text placement/scale.
-constexpr int    TRACK_KP_RADIUS_PX   = 4;   // tracked-landmark circle radius (px)
-constexpr int    TRACK_KP_THICKNESS   = 2;   // tracked-landmark circle stroke (px)
-constexpr int    TRACK_TEXT_X_PX      = 10;
-constexpr int    TRACK_TEXT_Y_PX      = 30;
-constexpr double TRACK_TEXT_SCALE     = 0.8;
-constexpr int    TRACK_TEXT_THICKNESS = 2;
-
-// ── 4-DoF alignment helpers ──────────────────────────────────────────────────
-// Least-squares plane fit through `pts`: centroid + unit normal = the singular
-// vector of the smallest singular value of the centered 3xN matrix. Returns
-// false when fewer than 3 points are available (plane underdetermined).
-bool fitPlane(const std::vector<Eigen::Vector3d>& pts,
-              Eigen::Vector3d& centroid, Eigen::Vector3d& normal) {
-    if (pts.size() < 3) {
-        return false;
-    }
-    centroid = Eigen::Vector3d::Zero();
-    for (const Eigen::Vector3d& p : pts) {
-        centroid += p;
-    }
-    centroid /= static_cast<double>(pts.size());
-    Eigen::Matrix3Xd M(3, static_cast<Eigen::Index>(pts.size()));
-    for (std::size_t i = 0; i < pts.size(); ++i) {
-        M.col(static_cast<Eigen::Index>(i)) = pts[i] - centroid;
-    }
-    Eigen::JacobiSVD<Eigen::Matrix3Xd> svd(M, Eigen::ComputeFullU);
-    normal = svd.matrixU().col(2).normalized();
-    return true;
-}
-
-// Tilt (degrees, folded to <= 90) between the ENU Up axis and the normal of the
-// best-fit plane through `pts` AFTER applying the rigid transform T. Negative
-// when the plane cannot be fitted (too few points).
-double alignedPlaneTiltDeg(const std::vector<Eigen::Vector3d>& pts,
-                           const Eigen::Matrix4d& T) {
-    std::vector<Eigen::Vector3d> transformed;
-    transformed.reserve(pts.size());
-    for (const Eigen::Vector3d& p : pts) {
-        transformed.push_back((T * p.homogeneous()).hnormalized());
-    }
-    Eigen::Vector3d c, n;
-    if (!fitPlane(transformed, c, n)) {
-        return -1.0;
-    }
-    const double cos_ang =
-        std::min(1.0, std::abs(n.dot(Eigen::Vector3d::UnitZ())));
-    return std::acos(cos_ang) * DEG_PER_RAD;
-}
-
-// Horizontal (E,N) bounding-box diagonal of a point set, in metres. Used by the
-// optional `alignment_min_spread_m` freeze gate.
-double horizontalSpreadM(const std::vector<Eigen::Vector3d>& pts) {
-    if (pts.empty()) {
-        return 0.0;
-    }
-    double min_e = pts.front().x(), max_e = min_e;
-    double min_n = pts.front().y(), max_n = min_n;
-    for (const Eigen::Vector3d& p : pts) {
-        min_e = std::min(min_e, p.x());
-        max_e = std::max(max_e, p.x());
-        min_n = std::min(min_n, p.y());
-        max_n = std::max(max_n, p.y());
-    }
-    return std::hypot(max_e - min_e, max_n - min_n);
-}
-#endif  // UAVLOC_WITH_DEBUG_VIEWER
-
-// Reads the next valid (OK + non-empty) frame from the reader into `out`.
-bool readNextValidFrame(sensor::VideoReader& reader, sensor::FrameData& out) {
-    int consecutive_empty = 0;
-    while (true) {
-        auto status = reader.read(out);
-        if (status == sensor::FrameStatus::END_OF_STREAM) {
-            return false;
-        }
-        if (status == sensor::FrameStatus::OK && out.valid && out.HasImage()) {
-            return true;
-        }
-        if (status == sensor::FrameStatus::EMPTY_FRAME) {
-            if (++consecutive_empty >= MAX_CONSECUTIVE_EMPTY_FRAMES) {
-                return false;
-            }
-        }
-        if (status == sensor::FrameStatus::ERROR ||
-            status == sensor::FrameStatus::CAMERA_DISCONNECTED) {
-            return false;
-        }
-    }
-}
+//! Per-frame stage profiling (util::Profiler → the viewer's "Profiling" table).
+//! OFF: it is a read-only instrument, but it costs time on the pipeline thread
+//! and nothing in this driver's job needs it. Flip it to true and rebuild to
+//! look at the stage breakdown of a run.
+constexpr bool PROFILE_ENABLED = false;
 
 }  // namespace
 }  // namespace uavloc
 
 int main(int argc, char** argv) {
     using namespace uavloc;
+    namespace dv = uavloc::debug_viewer;
 
     // Honour SPDLOG_LEVEL for a verbose per-frame run.
     spdlog::cfg::load_env_levels();
@@ -196,643 +101,123 @@ int main(int argc, char** argv) {
     const std::string config_path =
         (argc > 1) ? std::string(argv[1]) : DEFAULT_CONFIG_PATH;
 
-    // Optional hard cap on frames fed to the pipeline (headless smoke). 0 = run to
-    // END_OF_STREAM. Mirrors test_vo_pipeline_new's UAVLOC_VO_MAXFRAMES.
-    const char* mf = std::getenv("UAVLOC_VO_MAXFRAMES");
-    const int max_frames_env = mf ? std::max(0, std::atoi(mf)) : 0;
+    util::Profiler::set_enabled(PROFILE_ENABLED);
 
-    YAML::Node yaml;
-    try {
-        yaml = YAML::LoadFile(config_path);
-    } catch (const std::exception& e) {
-        spdlog::error("Failed to load YAML '{}': {}", config_path, e.what());
+    // Mission → run mode → source. All three steps are shared verbatim with
+    // test_vo_vpr_anchor_viewer, so the two drivers cannot drift apart.
+    eval::MissionSetup mission = eval::load_viewer_mission(config_path);
+    if (!mission.loaded) {
         return 1;
     }
-
-    sensor::VideoReaderConfig reader_cfg;
-    vo::VOConfig              vo_cfg;
-    fusion::FusionConfig      fusion_cfg;
-    try {
-        reader_cfg = sensor::VideoReaderConfig::fromYaml(yaml);
-        vo_cfg     = vo::VOConfig::fromYaml(yaml);
-        fusion_cfg = fusion::FusionConfig::fromYaml(yaml);  // defaults if no Fusion: key
-    } catch (const std::exception& e) {
-        spdlog::error("Failed to parse config: {}", e.what());
-        return 1;
+    auto source = eval::open_viewer_source(mission, DRIVER_NAME);
+    if (!source) {
+        return 0;  // soft-skip: the gitignored dataset is absent
     }
 
-    sensor::VideoReader reader(reader_cfg);
-    if (!reader.open()) {
-        spdlog::warn("test_vo_viewer: cannot open video '{}' — SKIPPED",
-                     reader_cfg.video_path);
-        return 0;  // soft-skip when the dataset is absent
-    }
-    spdlog::info("Video opened — fps: {:.1f}, total frames: {}",
-                 reader.getFps(), reader.getFrameCount());
+    // The whole pipeline behind one object; the source is OWNED by it, so the
+    // start/stop ordering is enforced there and not re-invented here (§4.5).
+    core::SystemManager sys(mission.system);
+    sys.attachSource(std::move(source));
 
-    vo::VOModule vo_module(vo_cfg);
+    // ── Driver-side accounting only (the display counts separately) ──────────
+    std::atomic<std::size_t> frames_processed{0};
+    std::atomic<std::size_t> pose_successes{0};
+    // Tracking state of the last processed frame (== VOModule::get_state()).
+    std::atomic<int> final_state{
+        static_cast<int>(vo::VOTrackingState::NOT_INITIALIZED)};
 
-    // Fusion back-end (F1). async_enabled from the YAML is honoured (default
-    // true = fusion runs on its own thread — the intended live mode; callbacks
-    // then fire on the fusion thread).
-    fusion::FusionModule fusion(fusion_cfg);
-    // Count of fused poses forwarded to the viewer (logged at shutdown).
-    std::atomic<std::size_t> fused_pushed{0};
-    // Count of lag-window corrections forwarded to the viewer (one per
-    // keyframe smoother update after the display anchor exists).
-    std::atomic<std::size_t> fused_corrections{0};
+    // Who starts the run AND how long it runs: one decision, taken once (see
+    // eval::viewer_run_policy). Headless ⇒ a capped, self-starting regression
+    // run; with a display ⇒ an uncapped session the operator drives.
+    const eval::RunPolicy policy = eval::viewer_run_policy();
+    // 0 = no cap. Below the cap, everything past the cap-th frame is ignored so
+    // the summary reports the capped run and not the few frames the
+    // supervisor's poll period let slip through.
+    const std::size_t max_frames = policy.max_frames;
 
-    // ── Latest keyframe map-point cloud (world, metres), captured on the worker
-    //    thread via the VOData publish callback. Guarded by a mutex because the
-    //    callback fires inside process_frame (worker thread) while the same worker
-    //    later reads it to push into the viewer. ──────────────────────────────────
-    std::mutex          map_mutex;
-    std::vector<Vec3_t> latest_map_points;
-    bool                map_dirty = false;
-
-    vo_module.add_data_out_callback([&](const vo::VOData& data) {
-        if (data.map_updated && !data.map_points.empty()) {
-            std::lock_guard<std::mutex> lk(map_mutex);
-            latest_map_points = data.map_points;
-            map_dirty         = true;
+    sys.callbacks().on_frame_processed.add(
+        [&](double /*t_msec*/, const core::FrameProcessed& /*fp*/) {
+            ++frames_processed;
+        });
+    sys.callbacks().on_vo_data.add([&](double /*t_msec*/, const vo::VOData& data) {
+        final_state.store(static_cast<int>(data.result.state));
+        if (max_frames > 0 && frames_processed.load() > max_frames) {
+            return;
+        }
+        if (data.result.has_pose) {
+            ++pose_successes;
         }
     });
 
-    // Shared shutdown flag between the VO worker and the (optional) viewer on the
-    // main thread. Only ever flips to true in the debug-viewer build (headless
-    // runs never spawn a worker).
-    std::atomic<bool> stop_requested{false};
+    // ── The pose dump — written on every run, no switch ──────────────────────
+    std::ofstream fused_dump =
+        eval::open_pose_dump(eval::VIEWER_DUMP_PATH, DRIVER_NAME);
 
-    std::size_t frames_processed = 0;
-    std::size_t pose_successes   = 0;
+    // The whole "DebugViewer:" section is parsed by the viewer library itself
+    // (window/panel keys plus the overlay parameters: alignment window and
+    // spread gate, HUD baseline, perf sampler period). The three run-policy
+    // fields are NOT in the YAML — they are this application's decision.
+    dv::DebugViewer::Config viewer_cfg =
+        dv::DebugViewer::Config::fromYaml(mission.yaml["DebugViewer"]);
+    viewer_cfg.autostart        = policy.autostart;
+    viewer_cfg.autostart_reason = policy.reason;
+    viewer_cfg.max_frames       = max_frames;
 
-#ifdef UAVLOC_WITH_DEBUG_VIEWER
-    namespace dv = uavloc::debug_viewer;
-
-    // Alignment window: number of initial TRACKING frames over which the (frozen)
-    // VO-world -> groundtruth-ENU rigid transform is computed (4-DoF gravity-
-    // aligned, scale fixed = 1 since VO is metric). Loaded from YAML so it is
-    // not a magic number.
-    const int alignment_window = std::max(
-        1, yaml["DebugViewer"]["alignment_window_frames"].as<int>(50));
-    // Optional freeze gate: when > 0, delay freezing the alignment until the
-    // groundtruth window spans at least this many metres horizontally (guards
-    // the yaw estimate against a near-stationary window). 0 = off (default,
-    // preserves the count-only behaviour).
-    const double alignment_min_spread_m =
-        yaml["DebugViewer"]["alignment_min_spread_m"].as<double>(0.0);
-
-    // Viewer config: forward the display/vertical scale + side-panel keys from
-    // the YAML DebugViewer: section (defaults preserved when keys are absent).
-    dv::DebugViewer::Config viewer_cfg;
-    viewer_cfg.display_scale =
-        yaml["DebugViewer"]["display_scale"].as<float>(viewer_cfg.display_scale);
-    viewer_cfg.vertical_scale =
-        yaml["DebugViewer"]["vertical_scale"].as<float>(viewer_cfg.vertical_scale);
-    viewer_cfg.video_stride =
-        yaml["DebugViewer"]["video_stride"].as<int>(viewer_cfg.video_stride);
-    viewer_cfg.log_capacity =
-        yaml["DebugViewer"]["log_capacity"].as<int>(viewer_cfg.log_capacity);
-    viewer_cfg.metric_plot_history =
-        yaml["DebugViewer"]["metric_plot_history"].as<int>(viewer_cfg.metric_plot_history);
-    viewer_cfg.metric_plot_follow_window =
-        yaml["DebugViewer"]["metric_plot_follow_window"].as<int>(viewer_cfg.metric_plot_follow_window);
-    viewer_cfg.histogram_bins =
-        yaml["DebugViewer"]["histogram_bins"].as<int>(viewer_cfg.histogram_bins);
-    viewer_cfg.perf_plot_history =
-        yaml["DebugViewer"]["perf_plot_history"].as<int>(viewer_cfg.perf_plot_history);
-    viewer_cfg.show_log =
-        yaml["DebugViewer"]["show_log"].as<bool>(viewer_cfg.show_log);
-    viewer_cfg.show_inliers =
-        yaml["DebugViewer"]["show_inliers"].as<bool>(viewer_cfg.show_inliers);
-    viewer_cfg.show_landmarks =
-        yaml["DebugViewer"]["show_landmarks"].as<bool>(true);
-    viewer_cfg.show_video =
-        yaml["DebugViewer"]["show_video"].as<bool>(viewer_cfg.show_video);
-    viewer_cfg.show_tracking =
-        yaml["DebugViewer"]["show_tracking"].as<bool>(viewer_cfg.show_tracking);
-    viewer_cfg.show_lost_poses =
-        yaml["DebugViewer"]["show_lost_poses"].as<bool>(viewer_cfg.show_lost_poses);
-    viewer_cfg.show_hud =
-        yaml["DebugViewer"]["show_hud"].as<bool>(viewer_cfg.show_hud);
-    viewer_cfg.show_perf =
-        yaml["DebugViewer"]["show_perf"].as<bool>(viewer_cfg.show_perf);
-    viewer_cfg.show_estimate =
-        yaml["DebugViewer"]["show_estimate"].as<bool>(viewer_cfg.show_estimate);
-    viewer_cfg.show_groundtruth =
-        yaml["DebugViewer"]["show_groundtruth"].as<bool>(viewer_cfg.show_groundtruth);
-    viewer_cfg.est_odom =
-        yaml["DebugViewer"]["est_odom"].as<bool>(viewer_cfg.est_odom);
-    viewer_cfg.est_odom_every_n =
-        yaml["DebugViewer"]["est_odom_every_n"].as<int>(viewer_cfg.est_odom_every_n);
-    viewer_cfg.est_odom_axes_scale =
-        yaml["DebugViewer"]["est_odom_axes_scale"].as<float>(viewer_cfg.est_odom_axes_scale);
-    viewer_cfg.show_fused =
-        yaml["DebugViewer"]["show_fused"].as<bool>(viewer_cfg.show_fused);
-    const int video_stride = std::max(1, viewer_cfg.video_stride);
-    // Minimum per-frame baseline (metres) before the COG heading is refreshed
-    // (anti-jitter when hovering / near-stationary). Same key as the old test.
-    const double hud_min_baseline_m =
-        yaml["DebugViewer"]["hud_min_baseline_m"].as<double>(0.5);
-    // Period (ms) of the /proc CPU%/RSS performance sampler thread.
-    const int perf_sample_ms =
-        std::max(50, yaml["DebugViewer"]["perf_sample_ms"].as<int>(500));
     dv::DebugViewer viewer(viewer_cfg);
     viewer.loadBatch({});  // empty -> live push mode (holds window, drains queues)
 
     // Capture spdlog output into the viewer's scrolling log panel.
     spdlog::default_logger()->sinks().push_back(viewer.logSink());
 
-    // Alignment accumulation state (worker-thread-local; captured by ref).
-    std::vector<Eigen::Vector3d> align_src;   // p_cam in the VO world frame
-    std::vector<Eigen::Vector3d> align_dst;   // matching groundtruth ENU
-    // Pending estimates buffered until the alignment freezes. The FULL T_wc is
-    // kept (not just the position) so the flushed poses carry roll/pitch/yaw
-    // for the viewer's "EstOdom" pose-axes rendering.
-    std::vector<std::pair<int, Eigen::Matrix4d>,
-                Eigen::aligned_allocator<std::pair<int, Eigen::Matrix4d>>>
-        est_buffer;
-    std::vector<std::pair<int, Eigen::Vector3d>> lost_buffer; // pending LOST markers
-    Eigen::Matrix4d T_align  = Eigen::Matrix4d::Identity();
-    bool   aligned           = false;
-    bool   gt_origin_set     = false;
-    double gt_o_lat = 0.0, gt_o_lon = 0.0, gt_o_alt = 0.0;
-
-    // HUD bookkeeping (worker-thread-local): last plotted VO-world position,
-    // accumulated metric path length, and the held course-over-ground heading.
-    Eigen::Vector3d last_pos            = Eigen::Vector3d::Zero();
-    bool            has_last_pos        = false;
-    double          trajectory_length_m = 0.0;
-    double          last_cog_heading_deg = 0.0;
-
-    // ── Fused-trajectory display anchor ──────────────────────────────────────
-    // The fused pose is metric ENU but anchored at (0, 0, agl_0) with a constant
-    // unknown yaw offset (the mount azimuth θ) — by design in F1. For display we
-    // only ANCHOR-TRANSLATE: capture the FIRST fused position f0 and the
-    // groundtruth ENU position g0 current at that moment, then push
-    // g0 + (f - f0). The residual constant yaw offset between the fused and GT
-    // lines is EXPECTED (θ is unobservable until VPR/F2) — do NOT rotate it
-    // away; seeing it is diagnostic. Guarded by fused_mutex: the worker writes
-    // latest_gt_enu while the fusion thread reads it in the result callback.
-    std::mutex      fused_mutex;
-    bool            latest_gt_valid = false;
-    Eigen::Vector3d latest_gt_enu   = Eigen::Vector3d::Zero();
-    bool            fused_f0_set    = false;
-    bool            fused_g0_set    = false;
-    Eigen::Vector3d fused_f0        = Eigen::Vector3d::Zero();
-    Eigen::Vector3d fused_g0        = Eigen::Vector3d::Zero();
-    // Fused poses arriving before any groundtruth exists are buffered until g0
-    // can be captured, then flushed anchor-translated (position + orientation;
-    // the frame id rides along for the viewer's correction splicing).
-    std::vector<std::tuple<uint64_t, Eigen::Vector3d, Eigen::Quaterniond>>
-        fused_pending;
-
-    // Fires on the FUSION thread in async mode — the DebugViewer push methods
-    // are thread-safe. The orientation is passed through as-is: the constant
-    // yaw offset θ (mount azimuth) baked into T_enu_c is EXPECTED — do NOT
-    // correct it; seeing it on the fused pose axes is diagnostic.
-    fusion.add_result_callback([&](const fusion::FusionResult& fres) {
-        if (!fres.has_pose) {
-            return;
-        }
-        const Eigen::Vector3d    f = fres.T_enu_c.translation();
-        const Eigen::Quaterniond q(fres.T_enu_c.rotation());
-        std::lock_guard<std::mutex> lk(fused_mutex);
-        if (!fused_f0_set) {
-            fused_f0     = f;
-            fused_f0_set = true;
-        }
-        if (!fused_g0_set) {
-            if (!latest_gt_valid) {
-                // no GT yet — buffer until g0 exists
-                fused_pending.emplace_back(fres.frame_id, f, q);
-                return;
-            }
-            fused_g0     = latest_gt_enu;
-            fused_g0_set = true;
-            for (const auto& [fid, fp, fq] : fused_pending) {
-                const Eigen::Vector3d d = fused_g0 + (fp - fused_f0);
-                viewer.pushFusedPose(d.cast<float>(), fq.cast<float>(), fid);
-                ++fused_pushed;
-            }
-            fused_pending.clear();
-        }
-        const Eigen::Vector3d d = fused_g0 + (f - fused_f0);
-        viewer.pushFusedPose(d.cast<float>(), q.cast<float>(), fres.frame_id);
-        ++fused_pushed;
-
-        // Keyframe smoother update: redraw the lag window with the corrected
-        // poses. Runs on the same thread as the smoother update (safe) and
-        // only once g0 exists (corrections before the first GT anchor are
-        // meaningless — skipped above via the pending buffer). Every lag pose
-        // goes through the SAME anchor mapping as the live pushes:
-        // g0 + (p - f0), quaternion passthrough.
-        if (fres.graph_updated) {
-            const auto window = fusion.getLagWindow();
-            std::vector<dv::FusedCorrection> corrected;
-            corrected.reserve(window.size());
-            for (const auto& lp : window) {
-                const Eigen::Vector3d    p = lp.T_enu_c.translation();
-                const Eigen::Quaterniond lq(lp.T_enu_c.rotation());
-                const Eigen::Vector3d    dp = fused_g0 + (p - fused_f0);
-                corrected.push_back({static_cast<uint64_t>(lp.frame_id),
-                                     dp.cast<float>(), lq.cast<float>()});
-            }
-            if (!corrected.empty()) {
-                viewer.pushFusedCorrection(corrected);
-                ++fused_corrections;
-            }
-        }
-    });
-#endif
-
-    // VO pipeline body. Runs on a worker thread in the debug-viewer build (the
-    // viewer owns the main thread for GL); runs inline otherwise.
-    auto run_pipeline = [&]() {
-#ifdef UAVLOC_WITH_DEBUG_VIEWER
-        // Transform a VO-world position through the frozen alignment and push it
-        // as a discrete LOST-state marker (red, "Lost state poses" checkbox).
-        auto push_lost = [&](int fid, const Eigen::Vector3d& p_world) {
-            const Eigen::Vector3d est =
-                (T_align * p_world.homogeneous()).hnormalized();
-            dv::InferredPose lp;
-            lp.frame_id = fid;
-            lp.x = est.x(); lp.y = est.y(); lp.z = est.z();
-            viewer.pushLostPose(lp);
-        };
-#endif
-        sensor::FrameData frame;
-        while (!stop_requested.load() && readNextValidFrame(reader, frame)) {
-            ++frames_processed;
-
-#ifdef UAVLOC_WITH_DEBUG_VIEWER
-            // Stream every `video_stride` frame into the viewer's video panel.
-            if (frames_processed % static_cast<std::size_t>(video_stride) == 0) {
-                viewer.pushFrame(frame.image);
-            }
-#endif
-
-            // ── Feed the frame to the VO module (synchronous: frame -> pose) ────
-            const vo::VOResult r = vo_module.process_frame(frame);
-
-            // Feed the fusion back-end (non-blocking enqueue in async mode).
-            fusion.push(r, frame.has_telemetry ? frame.telemetry
-                                               : sensor::TelemetryData{});
-
-            if (r.has_pose) {
-                ++pose_successes;
-            }
-
-#ifdef UAVLOC_WITH_DEBUG_VIEWER
-            // ── LOST markers: mark the last valid position — the point where
-            //    tracking broke — so the marker sits on the estimate polyline.
-            //    Push through T_align once aligned, otherwise buffer. ────────────
-            if (r.state == vo::VOTrackingState::LOST && has_last_pos) {
-                if (aligned) {
-                    push_lost(static_cast<int>(r.frame_id), last_pos);
-                } else {
-                    lost_buffer.emplace_back(static_cast<int>(r.frame_id), last_pos);
-                }
-            }
-
-            // ── HUD bookkeeping + per-frame metrics (has_pose frames) ───────────
-            if (r.has_pose) {
-                const Eigen::Vector3d p = r.T_wc.block<3, 1>(0, 3);
-                // Path length: sum of consecutive GLOBAL position deltas. The
-                // increment is identity on the first step of a (re-)initialised
-                // map; at those boundaries the position can jump, so skip them.
-                const bool reinit_boundary =
-                    r.T_prev_curr.isApprox(Eigen::Matrix4d::Identity(), 1e-9);
-                const Eigen::Vector3d dp = has_last_pos
-                    ? Eigen::Vector3d(p - last_pos) : Eigen::Vector3d::Zero();
-                if (has_last_pos && !reinit_boundary) {
-                    trajectory_length_m += dp.norm();
-                    // VO course-over-ground heading (ENU, 0 = North CW): rotate
-                    // the per-frame displacement into ENU through the frozen
-                    // Umeyama alignment (the old test used geo.R_enu_w() here).
-                    // Held when the baseline is too small to trust the direction.
-                    if (aligned && dp.norm() >= hud_min_baseline_m) {
-                        const Eigen::Vector3d dp_enu =
-                            T_align.block<3, 3>(0, 0) * dp;
-                        last_cog_heading_deg = wrap360(
-                            std::atan2(dp_enu.x(), dp_enu.y()) * DEG_PER_RAD);
-                    }
-                }
-                last_pos     = p;
-                has_last_pos = true;
-
-                // Per-frame metrics: inliers/landmarks line charts + HUD scalars.
-                const float hud_heading_tel =
-                    frame.has_telemetry
-                        ? static_cast<float>(wrap360(
-                              frame.telemetry.heading_deg +
-                              frame.telemetry.gimbal_pan_deg))
-                        : 0.0f;
-                dv::FrameMetrics fm;
-                fm.frame_id        = static_cast<int>(r.frame_id);
-                fm.inliers         = static_cast<float>(r.num_inliers);
-                fm.landmarks       = static_cast<float>(r.num_landmarks);
-                fm.heading_deg     = static_cast<float>(last_cog_heading_deg);
-                fm.heading_tel_deg = hud_heading_tel;
-                fm.distance_m      = static_cast<float>(trajectory_length_m);
-                viewer.pushMetrics(fm);
-
-                // Tracking sub-window: overlay the tracked landmark keypoints on
-                // the frame and annotate the counts (same stride as the plain
-                // video panel).
-                if (frames_processed % static_cast<std::size_t>(video_stride) == 0) {
-                    cv::Mat overlay = frame.image.clone();
-                    for (const Eigen::Vector2d& obs : r.tracked_observations) {
-                        cv::circle(overlay,
-                                   cv::Point(static_cast<int>(std::lround(obs.x())),
-                                             static_cast<int>(std::lround(obs.y()))),
-                                   TRACK_KP_RADIUS_PX,
-                                   cv::Scalar(0, 255, 0),  // green (BGR)
-                                   TRACK_KP_THICKNESS, cv::LINE_AA);
-                    }
-                    const std::string label =
-                        "Landmarks: " + std::to_string(r.num_landmarks) +
-                        "  tracked: " + std::to_string(r.tracked_observations.size());
-                    cv::putText(overlay, label,
-                                cv::Point(TRACK_TEXT_X_PX, TRACK_TEXT_Y_PX),
-                                cv::FONT_HERSHEY_SIMPLEX, TRACK_TEXT_SCALE,
-                                cv::Scalar(0, 255, 255), TRACK_TEXT_THICKNESS,
-                                cv::LINE_AA);
-                    viewer.pushTrackingFrame(overlay);
-                }
-            }
-
-            // ── Overlay: estimate vs groundtruth (TRACKING frames only) ─────────
-            if (r.has_pose && r.state == vo::VOTrackingState::TRACKING &&
-                frame.has_telemetry && frame.telemetry.valid &&
-                frame.telemetry.altitude_m > 0.0) {
-                const auto& t = frame.telemetry;
-                if (!gt_origin_set) {
-                    gt_o_lat      = t.latitude_deg;
-                    gt_o_lon      = t.longitude_deg;
-                    gt_o_alt      = t.altitude_m;
-                    gt_origin_set = true;
-                }
-                const dv::ENUPoint e = dv::gps_to_enu(
-                    t.latitude_deg, t.longitude_deg, t.altitude_m,
-                    gt_o_lat, gt_o_lon, gt_o_alt);
-                const Eigen::Vector3d gt_enu(e.e, e.n, e.u);
-                const Eigen::Vector3d p_cam = r.T_wc.block<3, 1>(0, 3);
-
-                // Groundtruth is independent of alignment — push it every frame.
-                dv::InferredPose gp;
-                gp.frame_id = static_cast<int>(r.frame_id);
-                gp.x = gt_enu.x(); gp.y = gt_enu.y(); gp.z = gt_enu.z();
-                viewer.pushGroundtruthPose(gp);
-
-                // Share the latest GT ENU with the fusion result callback (it
-                // captures g0, the GT anchor for the fused-line display).
-                {
-                    std::lock_guard<std::mutex> lk(fused_mutex);
-                    latest_gt_enu   = gt_enu;
-                    latest_gt_valid = true;
-                }
-
-                auto push_estimate = [&](int fid, const Eigen::Matrix4d& T_wc) {
-                    const Eigen::Vector3d p_world = T_wc.block<3, 1>(0, 3);
-                    const Eigen::Vector3d est =
-                        (T_align * p_world.homogeneous()).hnormalized();
-                    dv::InferredPose ep;
-                    ep.frame_id = fid;
-                    ep.x = est.x(); ep.y = est.y(); ep.z = est.z();
-                    // Orientation for the viewer's "EstOdom" pose axes: rotate
-                    // the VO camera rotation into ENU through the frozen
-                    // alignment, then extract ZYX (yaw, pitch, roll) — the same
-                    // convention the viewer's gizmo helper composes back as
-                    // Rz(yaw) * Ry(pitch) * Rx(roll).
-                    const Eigen::Matrix3d R_enu =
-                        T_align.block<3, 3>(0, 0) * T_wc.block<3, 3>(0, 0);
-                    const Eigen::Vector3d ypr = R_enu.eulerAngles(2, 1, 0);
-                    ep.yaw_deg   = ypr.x() * DEG_PER_RAD;
-                    ep.pitch_deg = ypr.y() * DEG_PER_RAD;
-                    ep.roll_deg  = ypr.z() * DEG_PER_RAD;
-                    viewer.pushPose(ep);
-                };
-
-                if (!aligned) {
-                    // Accumulate correspondences; buffer estimates until the frozen
-                    // transform is known, then flush them aligned.
-                    align_src.push_back(p_cam);
-                    align_dst.push_back(gt_enu);
-                    est_buffer.emplace_back(static_cast<int>(r.frame_id), r.T_wc);
-
-                    if (static_cast<int>(align_src.size()) >= alignment_window &&
-                        (alignment_min_spread_m <= 0.0 ||
-                         horizontalSpreadM(align_dst) >= alignment_min_spread_m)) {
-                        const std::size_t n_corr = align_src.size();
-                        Eigen::Matrix3Xd S(3, n_corr);
-                        Eigen::Matrix3Xd D(3, n_corr);
-                        for (std::size_t i = 0; i < n_corr; ++i) {
-                            S.col(static_cast<Eigen::Index>(i)) = align_src[i];
-                            D.col(static_cast<Eigen::Index>(i)) = align_dst[i];
-                        }
-                        // Diagnostic reference ONLY: the previous free-3D-rotation
-                        // Umeyama (scale fixed = 1). On this near-collinear camera
-                        // window its roll about the flight axis is degenerate — it
-                        // is computed solely for the before/after tilt log below.
-                        const Eigen::Matrix4d T_umeyama3d =
-                            Eigen::umeyama(S, D, /*with_scaling=*/false);
-
-                        // Snapshot the latest keyframe map-point cloud (VO world,
-                        // metres) — the landmark carpet defines the ground plane.
-                        std::vector<Eigen::Vector3d> plane_pts;
-                        {
-                            std::lock_guard<std::mutex> lk(map_mutex);
-                            plane_pts.assign(latest_map_points.begin(),
-                                             latest_map_points.end());
-                        }
-
-                        Eigen::Vector3d plane_c, plane_n;
-                        if (fitPlane(plane_pts, plane_c, plane_n)) {
-                            // 1) VO-side "up": landmark-plane normal, signed from
-                            //    the plane centroid TOWARD the mean camera position
-                            //    of the window (the camera flies above the ground).
-                            Eigen::Vector3d cam_mean = Eigen::Vector3d::Zero();
-                            for (const Eigen::Vector3d& s : align_src) {
-                                cam_mean += s;
-                            }
-                            cam_mean /= static_cast<double>(n_corr);
-                            Eigen::Vector3d up_vo = plane_n;
-                            if (up_vo.dot(cam_mean - plane_c) < 0.0) {
-                                up_vo = -up_vo;
-                            }
-
-                            // 2) R0: rotate up_vo onto ENU Up — kills roll/pitch.
-                            const Eigen::Matrix3d R0 =
-                                Eigen::Quaterniond::FromTwoVectors(
-                                    up_vo, Eigen::Vector3d::UnitZ())
-                                    .toRotationMatrix();
-
-                            // 3) Yaw about Up + translation: 2D Procrustes (no
-                            //    scale) on the horizontal components of the R0-
-                            //    levelled window. With C = sum(d_c * s'_c^T) the
-                            //    optimal yaw is atan2(C10 - C01, C00 + C11).
-                            Eigen::Vector3d s_mean = Eigen::Vector3d::Zero();
-                            Eigen::Vector3d d_mean = Eigen::Vector3d::Zero();
-                            std::vector<Eigen::Vector3d> s_lev(n_corr);
-                            for (std::size_t i = 0; i < n_corr; ++i) {
-                                s_lev[i] = R0 * align_src[i];
-                                s_mean += s_lev[i];
-                                d_mean += align_dst[i];
-                            }
-                            s_mean /= static_cast<double>(n_corr);
-                            d_mean /= static_cast<double>(n_corr);
-                            Eigen::Matrix2d C = Eigen::Matrix2d::Zero();
-                            for (std::size_t i = 0; i < n_corr; ++i) {
-                                const Eigen::Vector2d sc =
-                                    (s_lev[i] - s_mean).head<2>();
-                                const Eigen::Vector2d dc =
-                                    (align_dst[i] - d_mean).head<2>();
-                                C += dc * sc.transpose();
-                            }
-                            const double yaw = std::atan2(C(1, 0) - C(0, 1),
-                                                          C(0, 0) + C(1, 1));
-                            const Eigen::Matrix3d R_yaw =
-                                Eigen::AngleAxisd(yaw, Eigen::Vector3d::UnitZ())
-                                    .toRotationMatrix();
-
-                            // 4) T_align = [R_yaw*R0 | t]; t from the centroids
-                            //    (E,N via the 2D fit; U = mean altitude offset —
-                            //    yaw does not change the Up component).
-                            T_align.setIdentity();
-                            T_align.block<3, 3>(0, 0) = R_yaw * R0;
-                            T_align.block<3, 1>(0, 3) = d_mean - R_yaw * s_mean;
-
-                            // 5) Quantitative tilt check (headless-verifiable):
-                            //    re-fit the plane on the ALIGNED landmarks.
-                            spdlog::info("alignment: landmark-plane tilt after "
-                                         "align = {:.2f} deg (4-DoF gravity-aligned, "
-                                         "yaw {:.2f} deg, {} plane points)",
-                                         alignedPlaneTiltDeg(plane_pts, T_align),
-                                         yaw * DEG_PER_RAD, plane_pts.size());
-                            spdlog::info("alignment: OLD free-3D umeyama would give "
-                                         "landmark-plane tilt = {:.2f} deg "
-                                         "(degenerate roll, for comparison only)",
-                                         alignedPlaneTiltDeg(plane_pts, T_umeyama3d));
-                        } else {
-                            spdlog::warn("alignment: no landmark snapshot to fit "
-                                         "the ground plane ({} pts) — falling back "
-                                         "to free 3D umeyama (roll unconstrained)",
-                                         plane_pts.size());
-                            T_align = T_umeyama3d;
-                        }
-                        aligned = true;
-                        spdlog::info("alignment frozen at frame {} over {} TRACKING "
-                                     "correspondences", r.frame_id, n_corr);
-                        for (const auto& fp : est_buffer) {
-                            push_estimate(fp.first, fp.second);
-                        }
-                        est_buffer.clear();
-                        // Flush LOST markers gathered before alignment froze.
-                        for (const auto& fp : lost_buffer) {
-                            push_lost(fp.first, fp.second);
-                        }
-                        lost_buffer.clear();
-                    }
-                } else {
-                    push_estimate(static_cast<int>(r.frame_id), r.T_wc);
-                }
-            }
-
-            // ── Map-point cloud: push the latest keyframe cloud through the frozen
-            //    alignment (only once the transform exists). ────────────────────
-            if (aligned) {
-                std::vector<Vec3_t> pts_world;
-                {
-                    std::lock_guard<std::mutex> lk(map_mutex);
-                    if (map_dirty) {
-                        pts_world = latest_map_points;
-                        map_dirty = false;
-                    }
-                }
-                if (!pts_world.empty()) {
-                    std::vector<Eigen::Vector3f> pts_enu;
-                    pts_enu.reserve(pts_world.size());
-                    for (const Vec3_t& p : pts_world) {
-                        const Eigen::Vector3d en =
-                            (T_align * p.homogeneous()).hnormalized();
-                        pts_enu.emplace_back(static_cast<float>(en.x()),
-                                             static_cast<float>(en.y()),
-                                             static_cast<float>(en.z()));
-                    }
-                    viewer.pushMapPoints(pts_enu);
-                }
-            }
-#endif
-
-            if (max_frames_env > 0 &&
-                frames_processed >= static_cast<std::size_t>(max_frames_env)) {
-                break;
-            }
-        }
-        reader.close();
-#ifdef UAVLOC_WITH_DEBUG_VIEWER
-        // Natural end of data: do NOT stop the viewer and do NOT set
-        // stop_requested — the window stays open with the full visualization
-        // until the user closes it (viewer.run() then returns on the main
-        // thread, which sets the flag and joins us). The perf sampler keeps
-        // sampling meanwhile (idle CPU is fine to show). Headless runs are
-        // unaffected: run() returned immediately and the main thread joins
-        // this worker directly, then flags the sampler itself.
-        spdlog::info("pipeline finished ({} frames) — viewer stays open, "
-                     "close the window to exit", frames_processed);
-#endif
-    };  // run_pipeline
-
-    // Spawn the fusion thread (no-op in sync mode) before any frame is pushed.
-    fusion.start();
-
-#ifdef UAVLOC_WITH_DEBUG_VIEWER
-    // Performance sampler: a tiny dedicated thread that every `perf_sample_ms`
-    // takes a util::SysMonitor sample (CPU % + RSS MB from /proc, measured
-    // inside the util module) and pushes a PerfSample into the viewer's
-    // "Performance" streaming charts. Producer-side measurement — the viewer
-    // only plots (module decoupling). Terminates on stop_requested.
-    std::atomic<std::size_t> perf_samples{0};
-    std::thread perf_sampler([&]() {
-        uavloc::util::SysMonitor mon;
-        while (!stop_requested.load()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(perf_sample_ms));
-            uavloc::util::SysStats s;
-            if (mon.sample(s)) {
-                viewer.pushPerf(dv::PerfSample{s.t_sec, s.cpu_percent, s.rss_mb});
-                ++perf_samples;
-            }
-        }
-    });
-
-    // Viewer owns the main thread (GL singleton); VO runs on a worker. With a
-    // display, run() blocks until the user closes the window — whether mid-run
-    // (flag stops the worker's read loop) or after the data ended (worker
-    // already returned; join is immediate). Headless, run() returns at once and
-    // the join below simply waits for the pipeline to finish on its own.
-    std::thread worker(run_pipeline);
-    viewer.run();              // blocking on a display; returns immediately headless
-    if (viewer.hadDisplay()) {
-        stop_requested.store(true);
+    // Dump source: every position the viewer draws on the fused line, in push
+    // order. The viewer calls the sink from inside the same critical section it
+    // already holds around every push, so the order in the file is the order on
+    // the screen — no lock is needed here.
+    if (fused_dump.is_open()) {
+        viewer.setFusedPoseSink(
+            [&fused_dump](unsigned int fid, const Eigen::Vector3d& p) {
+                fused_dump << fid << ',' << p.x() << ',' << p.y() << ','
+                           << p.z() << '\n';
+            });
     }
-    worker.join();
-    stop_requested.store(true);  // sole sampler-exit signal on the headless path
-    perf_sampler.join();
-    spdlog::info("perf sampler: {} samples", perf_samples.load());
-#else
-    run_pipeline();
-#endif
 
-    // Drain the remaining fusion queue + join the fusion thread; the result
-    // callback may still fire during stop() — the viewer pushes are safe even
-    // after run() returned (they only append to a mutex-guarded queue).
-    fusion.stop();
-    spdlog::info("fused poses pushed: {}", fused_pushed.load());
-    spdlog::info("fused corrections applied: {}", fused_corrections.load());
+    // Subscribes to the four display channels, installs the Start/Stop control,
+    // and makes run() the owner of the run (auto-start + supervisor + sampler).
+    viewer.attach(sys);
 
-    spdlog::info("test_vo_viewer: frames_processed={} pose_successes={} final_state={}",
-                 frames_processed, pose_successes,
-                 static_cast<int>(vo_module.get_state()));
+    if (!sys.setup()) {
+        spdlog::error("{}: SystemManager setup failed", DRIVER_NAME);
+        return 1;
+    }
+
+    // Viewer owns the main thread (GL singleton) AND the run: it performs the
+    // configured auto-start, supervises the end of data (or the frame cap) and
+    // joins its two service threads before returning. With a display it blocks
+    // until the user closes the window; headless it returns as soon as the
+    // pipeline has finished.
+    viewer.run();
+
+    // An auto-start that was REFUSED leaves the button state at IDLE (a started
+    // run ends FINISHED, set by the supervisor; a user-paused one PAUSED). That
+    // is the only way this driver can still tell a failed start from a
+    // completed run.
+    if (policy.autostart && viewer.runState() == dv::DebugViewer::RunState::IDLE) {
+        spdlog::error("{}: SystemManager start failed", DRIVER_NAME);
+        return 1;
+    }
+
+    // Idempotent: the supervisor already stopped it in every normal path.
+    sys.stop();
+
+    // Closed only after stop(), so no producer can still be writing.
+    if (fused_dump.is_open()) {
+        fused_dump.close();
+        spdlog::info("{}: fused pose dump written to '{}'", DRIVER_NAME,
+                     eval::VIEWER_DUMP_PATH);
+    }
+
+    spdlog::info("{}: frames_processed={} pose_successes={} final_state={}",
+                 DRIVER_NAME, frames_processed.load(), pose_successes.load(),
+                 final_state.load());
     return 0;
 }

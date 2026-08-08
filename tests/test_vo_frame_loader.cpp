@@ -13,9 +13,12 @@
 
 #include <string>
 
+#ifndef UAVLOC_MISSION_CONFIG_PATH
+#define UAVLOC_MISSION_CONFIG_PATH "config/uavloc_yenbai800m_newvo.yaml"   // fallback; CMake injects the real path
+#endif
+
 namespace {
-const std::string DEFAULT_CONFIG_PATH =
-    "/home/minkeisrtx5090/Desktop/Workplace/HUST/uav_localization/config/uavloc_yenbai800m.yaml";
+const std::string DEFAULT_CONFIG_PATH = UAVLOC_MISSION_CONFIG_PATH;
 }  // namespace
 
 int main(int argc, char** argv) {

@@ -5,4 +5,6 @@ target_sources(uavloc PRIVATE
     sensor_factory.cpp
     telemetry_data.cpp
     drone_telemetry_csv_reader.cpp
+    data_source_interface.cpp
+    video_data_source.cpp
 )
