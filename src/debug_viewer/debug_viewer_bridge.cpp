@@ -100,6 +100,14 @@ bool SystemBridge::attach(core::SystemManager& sys) {
             onLagWindow(window);
         });
 
+    // ── channel 5: the periodic monitoring figures ───────────────────────────
+    // Unlike the four above this one fires on the MONITOR thread, on a fixed
+    // cadence (SystemConfig::stats_period_ms) that is INDEPENDENT of processing
+    // load — which is exactly what lets the HUD show the rate falling to 0 when
+    // the pipeline stalls instead of freezing at the last processed frame.
+    sys.callbacks().on_stats.add(
+        [this](const core::SystemStats& st) { onStats(st); });
+
     // ── The Start/Stop bridge ────────────────────────────────────────────────
     // The handler runs on the viewer's render thread — never on the source's
     // reading thread, which is the one caller pauseSource() would have to
@@ -526,6 +534,20 @@ void SystemBridge::onLagWindow(const std::vector<fusion::FusionLagPose>& window)
         viewer_.pushFusedCorrection(corrected);
         ++fused_corrections_;
     }
+}
+
+// Channel 5. Runs on the MONITOR thread (not the pipeline thread), on a fixed
+// cadence independent of processing load — so it keeps arriving, and keeps the
+// HUD honest, while the pipeline is stalled. Does nothing but repackage: no
+// alignment, no drawing, no allocation beyond the POD, because a slow handler
+// here would delay the monitor thread's next tick.
+void SystemBridge::onStats(const core::SystemStats& st) {
+    ThroughputSample ts;
+    ts.fps_windowed = st.fps_windowed;
+    ts.fps_mean     = st.fps_processed;
+    ts.proc_ms_mean = st.proc_ms_mean;
+    ts.window_sec   = st.fps_window_sec;
+    viewer_.pushThroughput(ts);
 }
 
 // ---------------------------------------------------------------------------

@@ -130,6 +130,9 @@
 #include "uavloc/new_vo/vo_module.h"
 #include "uavloc/anchor/absolute_fix.h"
 #include "uavloc/anchor/fake_anchor.h"
+#if UAVLOC_HAVE_VPR
+#include "uavloc/anchor/vpr_anchor.h"
+#endif
 #include "uavloc/core/system_config.h"
 #include "uavloc/core/system_manager.h"
 #include "uavloc/fusion/fusion_config.h"
@@ -427,7 +430,15 @@ int main(int argc, char** argv) {
             acc_csv.open(acc_path);
             if (acc_csv.is_open()) {
                 acc_csv << std::setprecision(CSV_PRECISION);
-                acc_csv << "frame_id,accuracy_m,err_2d_m,health,valid\n";
+                // pred_lat/pred_lon là ĐẦU RA SẢN PHẨM (LocalizationOutput),
+                // không phải suy ngược từ pred_x/pred_y: `latlon_from_enu` neo
+                // tại khung hợp nhất ĐẦU TIÊN có telemetry dùng được, chứ không
+                // phải tại khung 0, nên suy ngược qua gt_e/gt_n sẽ lệch gốc.
+                // gt_lat/gt_lon đi kèm để tệp này tự đủ khi vẽ lên bản đồ.
+                // ⚠ pred_lat/pred_lon = 0 khi geo chưa neo (những khung đầu,
+                // trước khi có telemetry hợp lệ) — lọc theo valid trước khi vẽ.
+                acc_csv << "frame_id,accuracy_m,err_2d_m,health,valid,"
+                           "pred_lat,pred_lon,gt_lat,gt_lon\n";
                 spdlog::info("test_full_flight: accuracy sidecar → '{}'", acc_path);
             } else {
                 spdlog::warn("test_full_flight: cannot open accuracy sidecar '{}'",
@@ -498,6 +509,15 @@ int main(int argc, char** argv) {
 
     // ── fake-fix producer (library) + per-fix accounting (here) ──────────────
     const bool fix_enabled = env_int("UAVLOC_FAKE_FIX", 0) != 0;
+    // UAVLOC_VPR_FIX=1 gắn anchor THẬT (truy hồi + khớp tinh trên ảnh vệ tinh)
+    // thay cho nguồn sinh-từ-groundtruth. Hai cờ loại trừ nhau: bật cả hai là
+    // mâu thuẫn về ý định, nên từ chối thay vì im lặng chọn một.
+    const bool vpr_enabled = env_int("UAVLOC_VPR_FIX", 0) != 0;
+    if (fix_enabled && vpr_enabled) {
+        spdlog::error("test_full_flight: UAVLOC_FAKE_FIX và UAVLOC_VPR_FIX loại "
+                      "trừ nhau — chọn một");
+        return 1;
+    }
     // Resolved only when it is going to be used: the helper logs the PROVENANCE
     // of every_kf/sigma_m/seed, and printing that on a run with no anchor
     // attached would suggest an experiment that is not happening.
@@ -639,6 +659,44 @@ int main(int argc, char** argv) {
                      fix_cfg.latency_kf, fix_cfg.seed,
                      fix_cfg.telemetry.csv_path, fix_cfg.frame_id_offset);
     }
+
+#if UAVLOC_HAVE_VPR
+    anchor::VprAnchor* vpr_anchor = nullptr;
+    if (vpr_enabled) {
+        auto vcfg = anchor::VprAnchorConfig::fromYaml(yaml);
+        // Nội tại lấy từ chính `Camera:` mà VO dùng — một nguồn duy nhất.
+        vcfg.camera_fx = sys_cfg.camera.fx;
+        vcfg.camera_fy = sys_cfg.camera.fy;
+        vcfg.camera_cx = sys_cfg.camera.cx;
+        vcfg.camera_cy = sys_cfg.camera.cy;
+        if (vcfg.vpr.database_path.empty()) {
+            spdlog::error("test_full_flight: UAVLOC_VPR_FIX=1 nhưng '{}' chưa khai "
+                          "VPR.database_path", config_path);
+            return 1;
+        }
+        auto va = std::make_unique<anchor::VprAnchor>(vcfg);
+        va->setEmitCallback([&](const anchor::AbsoluteFix& fix) {
+            fix_e_col          = fix.xy_enu.x();
+            fix_n_col          = fix.xy_enu.y();
+            fix_outlier_col    = 0;
+            fix_gen_this_frame = true;
+            ++fixes_generated;
+        });
+        vpr_anchor = va.get();
+        sys.setAnchor(std::move(va));
+        spdlog::info("test_full_flight: VPR ANCHOR THẬT — db='{}', khớp tinh "
+                     "top-{}, ngưỡng inlier {}, nhịp mỗi {} keyframe",
+                     vcfg.vpr.database_path, vcfg.vpr.fine_top_k,
+                     vcfg.vpr.min_inliers, vcfg.every_kf);
+        spdlog::warn("test_full_flight: cov/confidence của anchor này CHƯA HIỆU "
+                     "CHUẨN (C7)");
+    }
+#else
+    if (vpr_enabled) {
+        spdlog::error("test_full_flight: build này không có module VPR");
+        return 1;
+    }
+#endif
 
     if (!sys.setup() || !sys.start()) {
         spdlog::error("test_full_flight: SystemManager setup/start failed");
@@ -846,7 +904,10 @@ int main(int argc, char** argv) {
         if (acc_csv.is_open()) {
             acc_csv << res.frame_id << ',' << loc.accuracy_m << ',' << err_2d << ','
                     << health_name(fres.health) << ','
-                    << static_cast<int>(loc.valid) << '\n';
+                    << static_cast<int>(loc.valid) << ','
+                    << loc.latitude << ',' << loc.longitude << ','
+                    << (telem_ok ? telem.latitude_deg : nan) << ','
+                    << (telem_ok ? telem.longitude_deg : nan) << '\n';
         }
 
         // ── statistics ───────────────────────────────────────────────────────

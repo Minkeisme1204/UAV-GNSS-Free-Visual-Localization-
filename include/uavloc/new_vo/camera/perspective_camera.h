@@ -8,8 +8,10 @@
 // handled through sensor::CameraModel::undistortPoints (returns normalised
 // coordinates), then mapped back to pixel space with the pinhole intrinsics.
 //
-// This is NEW code (not a stella mirror) and follows the project PascalCase
-// convention. See .docs/designs/new_vo_port_notes.md.
+// The adapter itself is NEW code and follows the project PascalCase convention,
+// but compute_image_bounds() IS a faithful mirror of
+// stella_vslam::camera::perspective::compute_image_bounds().
+// See .docs/designs/new_vo_port_notes.md.
 
 #include "uavloc/new_vo/camera/base.h"
 #include "uavloc/sensor/camera_model.h"
@@ -29,6 +31,8 @@ public:
     explicit PerspectiveCamera(const sensor::CameraModel& model);
 
     ~PerspectiveCamera() override = default;
+
+    ImageBounds compute_image_bounds() const override;
 
     cv::Point2f undistort_point(const cv::Point2f& dist_pt) const override;
 

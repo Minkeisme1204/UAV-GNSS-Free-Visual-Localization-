@@ -131,6 +131,26 @@ else
     echo "SKIP K3/K4: only meaningful with ENABLE_VIEWER=OFF"
 fi
 
+
+# ── K6: the vpr module must not leak satvpr/ONNX symbols into libuavloc's ABI ─
+# CMake's PRIVATE keyword does NOT hide symbols — it only stops include dirs and
+# link deps from propagating to other targets. Measured on the first wiring:
+# libuavloc.so exported 56 satvpr:: and 12 Ort:: symbols. Two mechanisms are
+# needed and both are load-bearing:
+#   * --exclude-libs,libsatvpr_core.a   hides symbols coming FROM the archive
+#   * -fvisibility-inlines-hidden on vpr_module.cpp hides the satvpr inline
+#     functions instantiated into uavloc's OWN object (3 weak symbols)
+# If either regresses, this check catches it.
+if [ -f "$LIB" ]; then
+    leak=$(nm -DC "$LIB" 2>/dev/null | grep -cE "satvpr::|Ort::" || true)
+    if [ "$leak" -ne 0 ]; then
+        fail K6 "libuavloc.so exports $leak satvpr::/Ort:: symbol(s) — the vpr module leaks its backend into the ABI"
+        nm -DC "$LIB" 2>/dev/null | grep -E "satvpr::|Ort::" | head -5 | sed 's/^/        /'
+    else
+        pass K6 "libuavloc.so exports no satvpr::/Ort:: symbol"
+    fi
+fi
+
 if [ "$failures" -ne 0 ]; then
     echo "build_hygiene: $failures check(s) failed"
     exit 1

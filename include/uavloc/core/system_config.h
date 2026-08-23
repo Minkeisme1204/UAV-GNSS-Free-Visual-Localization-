@@ -68,6 +68,10 @@ struct SystemConfig {
     //! Monitor-thread publication period [ms].
     unsigned int stats_period_ms = 500;
 
+    //! Trailing window used for the live throughput figures published in
+    //! SystemStats (fps_windowed / proc_ms_mean) [s].
+    double stats_fps_window_sec = 3.0;
+
     //! Time span of the core::Extrapolator buffers [s] — how far back the
     //! attitude / gimbal / GNSS samples are kept so an image arriving late can
     //! still be paired with them. <= 0 means unbounded (memory grows for the

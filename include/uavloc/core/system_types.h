@@ -128,8 +128,19 @@ struct SystemStats {
     unsigned long long frames_processed = 0;  //!< actually ran through the pipeline
     unsigned long long frames_dropped   = 0;  //!< lost to DROP_OLDEST / refused pushes
 
-    std::size_t queue_depth   = 0;    //!< items currently in the input queue
-    double      fps_processed = 0.0;  //!< processing rate [frames/s]
+    std::size_t queue_depth = 0;  //!< items currently in the input queue
+
+    //! CUMULATIVE mean processing rate since start [frames/s]:
+    //! frames_processed / total pipeline seconds, i.e. 1 / (mean per-frame
+    //! pipeline time) — the HARMONIC mean of the instantaneous rates. It counts
+    //! pipeline time only (idle and decode excluded) and it converges, so it
+    //! does NOT react to a stall: a frozen pipeline keeps reporting the last
+    //! converged value. Use fps_windowed for a live readout.
+    double fps_processed = 0.0;
+
+    double fps_windowed   = 0.0;  //!< wall-clock rate over the trailing window [frames/s]
+    double proc_ms_mean   = 0.0;  //!< mean pipeline time per frame in that window [ms]
+    double fps_window_sec = 0.0;  //!< length of that window [s], so a display can label it
 
     unsigned int lost_events   = 0;  //!< VO tracking losses so far
     unsigned int reinit_events = 0;  //!< VO re-initializations so far

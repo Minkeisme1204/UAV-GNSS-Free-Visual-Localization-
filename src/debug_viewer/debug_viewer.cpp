@@ -29,6 +29,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <deque>
 #include <filesystem>
@@ -74,6 +75,12 @@ const char* const TRACKING_PANEL_NAME = "VO tracking";
 constexpr float GT_COLOR[4]       = {0.2f, 0.9f, 0.4f, 1.0f};  // green
 constexpr float INFERRED_COLOR[4] = {0.95f, 0.55f, 0.1f, 1.0f}; // orange
 constexpr float FUSED_COLOR[4]    = {0.90f, 0.20f, 0.90f, 1.0f}; // magenta
+
+// EstOdom-only "error links": one straight segment from each drawn FUSED pose
+// (the system's final output) to the groundtruth pose of the SAME frame id.
+// A paler magenta than the fused line itself so the link cannot be mistaken
+// for the trajectory.
+constexpr float FUSED_LINK_COLOR[4] = {0.85f, 0.45f, 0.95f, 1.0f}; // pale magenta
 
 // Colour + screen-space point size for the discrete LOST-state markers.
 constexpr float LOST_COLOR[4]           = {0.95f, 0.15f, 0.15f, 1.0f}; // red
@@ -465,6 +472,13 @@ struct DebugViewer::Impl {
     // Per-point roll/pitch/yaw (degrees, parallel to inferred_points) so the
     // estimate trajectory can be re-rendered as pose-axes gizmos ("EstOdom").
     std::vector<Eigen::Vector3f> inferred_rpy_deg;
+    // frame id -> index into gt_points, the lookup side of the fused <->
+    // groundtruth error links (fused_frame_ids is the other side). Filled ONLY
+    // by the metric pushGroundtruthPose() path: the GPS/barcode path carries
+    // imageIds from a different numbering, and mixing the two would
+    // manufacture false pairings.
+    // Indices stay valid because gt_points only ever grows.
+    std::unordered_map<uint64_t, std::size_t> gt_index_by_frame;
 
     // Discrete LOST-state markers in render units, fed via pushLostPose().
     std::vector<Eigen::Vector3f> lost_points;
@@ -587,6 +601,14 @@ struct DebugViewer::Impl {
     std::atomic<bool> profile_dirty_{false};
     ProfileSnapshot   profile_render_;
 
+    // HUD throughput figures: same LATEST-WINS shape as the profiling table
+    // (only the newest reading is ever shown, so queueing older ones is waste).
+    // Producer: the monitor thread, under queue_mutex; consumer: the render
+    // thread, which copies it into throughput_render_ on the dirty flag.
+    ThroughputSample  throughput_latest_;
+    std::atomic<bool> throughput_dirty_{false};
+    ThroughputSample  throughput_render_;
+
     // Latest video frame: single drop-oldest slot (producer: worker).
     std::mutex        frame_mutex_;
     cv::Mat           frame_latest_;
@@ -646,6 +668,9 @@ struct DebugViewer::Impl {
     // "Follow camera" checkbox: gates the periodic auto-recenter lookat().
     bool follow_camera_        = true;
     bool inferred_line_active_ = false;
+    // EstOdom error link set (fused pose -> groundtruth of the same frame):
+    // it has no checkbox of its own, it follows the EstOdom mode.
+    bool fused_links_active_ = false;
     // Names of the live pose-axes drawables per trajectory (for tear-down on
     // toggle) and the next buffer index not yet considered for an axes gizmo.
     // Same swap mechanism for all three: estimate / groundtruth / fused.
@@ -938,6 +963,16 @@ void DebugViewer::pushProfile(const ProfileSnapshot& p) {
     impl_->profile_dirty_.store(true);
 }
 
+void DebugViewer::pushThroughput(const ThroughputSample& s) {
+    {
+        // Replace the single latest-wins slot so the render thread always reads
+        // a consistent set of figures (never a half-updated one).
+        std::lock_guard<std::mutex> lock(impl_->queue_mutex);
+        impl_->throughput_latest_ = s;
+    }
+    impl_->throughput_dirty_.store(true);
+}
+
 void DebugViewer::pushFrame(const cv::Mat& image) {
     if (image.empty()) return;
     {
@@ -1145,13 +1180,28 @@ void DebugViewer::run() {
             ImGui::Checkbox("Anchor fixes", &impl_->show_anchor_fixes_);
             ImGui::End();
 
-            // HUD: VO course-over-ground heading, telemetry heading, path length.
+            // HUD: VO course-over-ground heading, telemetry heading, path
+            // length, and the live throughput block.
             if (impl_->show_hud_) {
-                ImGui::SetNextWindowSize(ImVec2(240, 110), ImGuiCond_FirstUseEver);
+                ImGui::SetNextWindowSize(ImVec2(260, 200), ImGuiCond_FirstUseEver);
                 ImGui::Begin("HUD", &impl_->show_hud_);
                 ImGui::Text("Heading(VO)  : %.1f deg", impl_->hud_heading_);
                 ImGui::Text("Heading(tel) : %.1f deg", impl_->hud_heading_tel_);
                 ImGui::Text("Distance     : %.1f m",   impl_->hud_distance_);
+                ImGui::Separator();
+                // FPS (Ns)   — WALL-CLOCK frames/s over the last N seconds. It
+                //              reacts: a stalled pipeline decays it to 0.
+                // FPS (mean) — CUMULATIVE mean since start, pipeline time only
+                //              (idle and decode excluded). It converges and
+                //              then stops moving.
+                // Proc       — mean pipeline time per frame inside the window.
+                // The two FPS numbers are NOT redundant: the first says what the
+                // system is delivering right now, the second what the pipeline
+                // alone is capable of on average.
+                ImGui::Text("FPS (%.0fs)   : %.1f", impl_->throughput_render_.window_sec,
+                                                    impl_->throughput_render_.fps_windowed);
+                ImGui::Text("FPS (mean)   : %.1f",  impl_->throughput_render_.fps_mean);
+                ImGui::Text("Proc         : %.0f ms/f", impl_->throughput_render_.proc_ms_mean);
                 ImGui::End();
             }
 
@@ -1407,6 +1457,54 @@ void DebugViewer::run() {
             }
         }
     };
+    // EstOdom-only: one GL_LINES segment per drawn FUSED pose — the system's
+    // final output, so the segment measures the error of the SYSTEM, not of
+    // bare VO — joining it to the groundtruth pose of the SAME frame id, so
+    // the per-frame error is readable directly off the 3D view. Deliberately
+    // has NO checkbox of its own — selecting EstOdom shows it; each side is
+    // still gated by its own trajectory checkbox, because a link whose
+    // endpoint is hidden means nothing. Same `est_odom_every_n` cadence as the
+    // axes gizmos, so every link starts on a drawn gizmo. A fused frame with
+    // no groundtruth entry draws NO link — never paired with an approximate
+    // neighbour, which would draw a wrong segment.
+    auto refresh_error_links = [&](const char* name,
+                                   const std::vector<Eigen::Vector3f>& pred_pts,
+                                   const auto& pred_ids, bool visible,
+                                   bool rebuild, bool& active,
+                                   const float (&color)[4]) {
+        if (!viewer) return;
+        if (!visible) {
+            if (active) {
+                viewer->remove_drawable(name);
+                active = false;
+            }
+            return;
+        }
+        if (active && !rebuild) return;
+        const std::size_t every = static_cast<std::size_t>(
+            std::max(1, impl_->cfg.est_odom_every_n));
+        const std::size_t n = std::min(pred_pts.size(), pred_ids.size());
+        std::vector<Eigen::Vector3f> verts;
+        verts.reserve(2 * (n / every + 1));
+        for (std::size_t i = 0; i < n; i += every) {
+            const auto it =
+                impl_->gt_index_by_frame.find(static_cast<uint64_t>(pred_ids[i]));
+            if (it == impl_->gt_index_by_frame.end()) continue;
+            verts.push_back(pred_pts[i]);
+            verts.push_back(impl_->gt_points[it->second]);
+        }
+        if (verts.empty()) {
+            if (active) {
+                viewer->remove_drawable(name);
+                active = false;
+            }
+            return;
+        }
+        viewer->update_drawable(
+            name, std::make_shared<glk::ThinLines>(verts, /*line_strip=*/false),
+            guik::FlatColor(color[0], color[1], color[2], color[3]));
+        active = true;
+    };
     // Discrete red markers at each LOST-tracking position. `rebuild` forces a
     // re-upload when new points arrived; otherwise this only handles the
     // checkbox toggle (draw on enable, remove on disable) without re-uploading.
@@ -1606,6 +1704,8 @@ void DebugViewer::run() {
             impl_->gt_rpy_deg.emplace_back(static_cast<float>(p.roll_deg),
                                            static_cast<float>(p.pitch_deg),
                                            static_cast<float>(p.yaw_deg));
+            impl_->gt_index_by_frame.emplace(static_cast<uint64_t>(p.frame_id),
+                                             impl_->gt_points.size() - 1);
         }
         for (const auto& p : lost_local) {
             impl_->lost_points.push_back(impl_->applyScale(p.x, p.y, p.z));
@@ -1658,6 +1758,10 @@ void DebugViewer::run() {
             }
             impl_->fused_axes_names_.clear();
             impl_->fused_axes_next_idx_ = 0;
+            if (impl_->fused_links_active_) {
+                viewer->remove_drawable("fused_gt_links");
+                impl_->fused_links_active_ = false;
+            }
         }
         // Estimate display: always called so the "VO"/"EstOdom" checkbox
         // toggles are honoured even when no new points arrived this pass
@@ -1672,6 +1776,16 @@ void DebugViewer::run() {
         // style swap / full re-upload from the accumulated buffers on re-enable);
         // in EstOdom mode this also uploads green axes for fresh GT points.
         refresh_gt_display();
+        // EstOdom error links: rebuilt whenever either endpoint buffer grew
+        // (new groundtruth can complete a pair that had none), otherwise only
+        // the checkbox/mode toggle is honoured.
+        const bool links_rebuild = !gt_local.empty() || fused_new_data;
+        refresh_error_links("fused_gt_links", impl_->fused_points,
+                            impl_->fused_frame_ids,
+                            impl_->show_est_odom_ && impl_->show_fused_ &&
+                                impl_->show_groundtruth_,
+                            links_rebuild, impl_->fused_links_active_,
+                            FUSED_LINK_COLOR);
         // Rebuild the marker cloud when new LOST points arrived; otherwise still
         // call to honour the checkbox toggle (draw on enable / remove on disable).
         refresh_lost_markers(!lost_local.empty());
@@ -1780,6 +1894,12 @@ void DebugViewer::run() {
         if (impl_->profile_dirty_.exchange(false)) {
             std::lock_guard<std::mutex> lock(impl_->queue_mutex);
             impl_->profile_render_ = impl_->profile_latest_;
+        }
+
+        // 1d) HUD throughput figures: latest-wins single slot, same shape.
+        if (impl_->throughput_dirty_.exchange(false)) {
+            std::lock_guard<std::mutex> lock(impl_->queue_mutex);
+            impl_->throughput_render_ = impl_->throughput_latest_;
         }
 
         // 2) The metric line/histogram windows are drawn directly in the

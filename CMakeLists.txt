@@ -30,8 +30,27 @@ endif()
 
 find_package(GTSAM    REQUIRED)   # fusion module (installed in /usr/local)
 
-# Uncomment when the corresponding module is implemented:
-# find_package(onnxruntime  REQUIRED)   # vpr module
+# ── vpr module: satvpr_core + ONNX Runtime ────────────────────────────────────
+# satvpr_core là bản C++ của pipeline DINO+VLAD+PCA, giữ ở repo satVPR vì bộ test
+# parity của nó cần dataset và artifact không thể đưa vào repo này
+# (.claude/rules/constraints.md cấm binary asset trong git).
+#
+# SATVPR_ROOT mặc định trỏ .thirdparty/satvpr (chỗ dành cho submodule), ghi đè
+# được bằng -DSATVPR_ROOT=... để build khi chưa tạo submodule.
+set(SATVPR_ROOT "${PROJECT_SOURCE_DIR}/.thirdparty/satvpr"
+    CACHE PATH "Thu muc goc cua satvpr_core")
+
+if(EXISTS "${SATVPR_ROOT}/CMakeLists.txt")
+    find_package(onnxruntime REQUIRED)      # 1.23.2 @ /usr/local, cho module vpr
+    # Test parity cua satvpr_core can dataset cua repo do -> tat khi nhung.
+    set(SATVPR_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    add_subdirectory("${SATVPR_ROOT}" ${CMAKE_BINARY_DIR}/satvpr EXCLUDE_FROM_ALL)
+    set(UAVLOC_HAVE_VPR TRUE)
+    message(STATUS "Found satvpr_core: ${SATVPR_ROOT}")
+else()
+    set(UAVLOC_HAVE_VPR FALSE)
+    message(WARNING "satvpr_core khong co o ${SATVPR_ROOT} -- module vpr se khong duoc build")
+endif()
 
 # ── g2o (prebuilt in-tree, consumed by new_vo/optimize) ───────────────────────
 # g2o is already built under .thirdparty/g2o/build (headers in .thirdparty/g2o,

@@ -387,6 +387,11 @@ public:
     // LATEST-WINS slot (the table only ever shows the newest snapshot) and
     // rendered by the "Profiling" window. Row order is preserved. Thread-safe.
     void pushProfile(const ProfileSnapshot& p);
+    // Push the latest throughput figures (live windowed FPS, cumulative mean
+    // FPS, mean pipeline time) from any thread; stored in a single LATEST-WINS
+    // slot and rendered as three HUD lines. The producer measures — the viewer
+    // only formats what it is given. Thread-safe.
+    void pushThroughput(const ThroughputSample& s);
     // Push one predicted-vs-groundtruth position error sample (metres, already
     // paired by frame id by the producer) from any thread; drained into the
     // "Error (m)" window's line chart, histogram and running summary by the

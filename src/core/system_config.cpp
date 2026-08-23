@@ -76,6 +76,16 @@ SystemConfig SystemConfig::fromYaml(const YAML::Node& root) {
     cfg.publish_images  = node["publish_images"].as<bool>(cfg.publish_images);
     cfg.stats_period_ms = node["stats_period_ms"].as<unsigned int>(cfg.stats_period_ms);
 
+    const double fps_window =
+        node["stats_fps_window_sec"].as<double>(cfg.stats_fps_window_sec);
+    if (fps_window <= 0.0) {
+        spdlog::warn("SystemConfig: stats_fps_window_sec = {} is not a usable "
+                     "trailing window for the live throughput figures — keeping "
+                     "the default {}s", fps_window, cfg.stats_fps_window_sec);
+    } else {
+        cfg.stats_fps_window_sec = fps_window;
+    }
+
     cfg.extrapolator_buffer_span_sec =
         node["extrapolator_buffer_span_sec"].as<double>(cfg.extrapolator_buffer_span_sec);
     if (cfg.extrapolator_buffer_span_sec <= 0.0) {

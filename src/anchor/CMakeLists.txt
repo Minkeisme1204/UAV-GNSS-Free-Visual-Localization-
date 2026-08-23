@@ -4,3 +4,7 @@
 target_sources(uavloc PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/fake_anchor.cpp
 )
+
+if(UAVLOC_HAVE_VPR)
+    target_sources(uavloc PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vpr_anchor.cpp)
+endif()

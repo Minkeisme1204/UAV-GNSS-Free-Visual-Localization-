@@ -74,7 +74,20 @@ struct AnchorQuery {
     double agl_m           = 0.0;
     double yaw_deg         = 0.0;
     double gimbal_pan_deg  = 0.0;
+    //! ⚠ Measured FROM THE HORIZONTAL PLANE: ~90 is nadir, not 0. The off-nadir
+    //! angle is `|90 - gimbal_tilt_deg|` (sensor::TelemetryData:26).
     double gimbal_tilt_deg = 0.0;
+
+    //! Airframe roll and pitch [deg]. A consumer that rectifies the frame to a
+    //! bird's-eye view needs the FULL attitude, not just heading — cancelling
+    //! yaw alone leaves the perspective of an oblique camera intact and leaves
+    //! the frame CENTRE standing in for the point below the aircraft. On the Yen
+    //! Bai set those two are a median 110 m apart.
+    //!
+    //! Both already travel in sensor::TelemetryData; they simply were not copied
+    //! here before.
+    double roll_deg  = 0.0;
+    double pitch_deg = 0.0;
 
     //! Why this request exists (see AnchorRequestReason). Defaults to the
     //! cadence case, so an existing caller keeps its previous meaning.
