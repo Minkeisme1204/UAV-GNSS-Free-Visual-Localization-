@@ -30,6 +30,17 @@ struct PerfSample {
     float  rss_mb      = 0.0f;  // resident set size (MB)
 };
 
+// One live throughput sample for the HUD. The PRODUCER measures (core::
+// SystemManager, which owns a trailing-window RateEstimator and publishes on
+// the monitor thread); the viewer only formats — it owns no clock and no
+// counter. POD only (no GL/ImGui involvement).
+struct ThroughputSample {
+    double fps_windowed = 0.0;  // live wall-clock rate over the trailing window [frames/s]
+    double fps_mean     = 0.0;  // cumulative mean since start [frames/s]
+    double proc_ms_mean = 0.0;  // mean pipeline time per frame in the window [ms]
+    double window_sec   = 0.0;  // window length [s] — the viewer only labels it
+};
+
 // One row of the "Profiling" table: the accumulated timing of one measured
 // computation block. The PRODUCER measures and derives every number (the viewer
 // only formats them), keeping the viewer decoupled from the profiling

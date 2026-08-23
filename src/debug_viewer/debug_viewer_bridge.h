@@ -67,7 +67,7 @@ public:
     SystemBridge(const SystemBridge&)            = delete;
     SystemBridge& operator=(const SystemBridge&) = delete;
 
-    //! Subscribe to the four display channels and install the run control.
+    //! Subscribe to the five display channels and install the run control.
     //! Returns false when a system is already attached.
     bool attach(core::SystemManager& sys);
 
@@ -106,6 +106,10 @@ private:
     void onVoData(const vo::VOData& data);
     void onFusionResult(const fusion::FusionResult& fres);
     void onLagWindow(const std::vector<fusion::FusionLagPose>& window);
+    //! Channel 5 — the periodic monitoring figures. MONITOR thread, fixed
+    //! cadence, independent of processing load; repackages the throughput
+    //! numbers for the HUD and nothing else.
+    void onStats(const core::SystemStats& st);
 
     // ── helpers, all moved verbatim from the driver ─────────────────────────
     void pushProfileSnapshot(int frame_id);

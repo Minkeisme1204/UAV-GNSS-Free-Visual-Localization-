@@ -455,7 +455,7 @@ against `head -n 193 build/tests/s0_GOLDEN.csv` (headless is still capped at 200
 
 ### Current core tests (registered with `ctest`)
 They take their config from `UAVLOC_MISSION_CONFIG_PATH` unless the Input column says
-otherwise; `argv[1]` overrides everywhere. 19 registered at `ENABLE_VIEWER=ON`, 15 at OFF.
+otherwise; `argv[1]` overrides everywhere. 20 registered at `ENABLE_VIEWER=ON`, 16 at OFF.
 
 | Target | Input | Gates (acceptance criteria) |
 |---|---|---|
@@ -474,6 +474,7 @@ otherwise; `argv[1]` overrides everywhere. 19 registered at `ENABLE_VIEWER=ON`, 
 | `test_vo_vpr_anchor_viewer` | yenbai800m_newvo | the **whole flow**: `SystemManager` + `VideoDataSource` + `DebugViewer` + an absolute-position producer (M1 `anchor::FakeAnchor`; real VPR is Phase 2 and swaps the producer only). Gates that the lifecycle `anchor[REQ]` → `anchor[EMIT]` → `anchor[APPLY]` runs end to end and reports `FakeAnchorStats` + `AnchorFixCounters` + `FusionFixStats`; `applied == 0` is logged as a finding, not hidden. ⚠ the fixes are manufactured **from groundtruth** — the viewer shows a permanent red banner and the driver repeats it in the log. Dump: `test_vo_vpr_anchor_viewer_dump.csv`. Only with `ENABLE_VIEWER=ON` |
 | `test_driver_parity` | munfrl_dataset3 | **cross-driver gate**: `test_full_flight` and `test_vo_viewer` must produce the same trajectory (per-frame difference constant to ≤ 1e-6 m — the offset itself may differ). **ON-only since 2026-08-08** (it reads the viewer's dump, which does not exist at OFF). At ON the viewer dump is display-anchored (`g₀ + (f − f₀)`) and the constant is that anchor: dx/dy mean 0.000000 m, dz mean −0.023800 m, worst spread 9.000e−14 m **[đo 2026-08-08, 159 common frames]** |
 | `test_viewer_align` | none (pure unit) | `debug_viewer::TrajectoryAligner` 4-DoF fit. Only with `ENABLE_VIEWER=ON` |
+| `test_rate_estimator` | none (pure unit) | `core::RateEstimator`, the trailing-window rate behind `SystemStats::fps_windowed`: steady 10 Hz reads ~10 fps and reproduces the pipeline time fed in; **a stall decays to EXACTLY 0** (the property `fps_processed` cannot provide); the warm-up denominator is `min(window, elapsed)`, not the full window; a burst is capped at `count / window_sec`; one frame with zero elapsed time does not divide by zero. Synthetic time points only — no sleeps, no dataset. Registered in **both** configurations |
 | `test_viewer_run_policy` | none (pure unit) | `eval::viewer_run_policy()`: `DISPLAY`/`WAYLAND_DISPLAY` set in-process, 5 cases (neither / X11 / Wayland / both / **both set but empty**); asserts the `autostart` + `max_frames` PAIR — headless ⇒ (true, 200), a display ⇒ (false, 0). Registered in **both** configurations (the predicate lives in `uavloc_test_eval`) |
 | `test_build_hygiene` | none (source tree + `libuavloc.so`) | the invariant that replaced R4 — see "CMake Hierarchy". K1/K2/K2b in both configurations, K3/K4 at OFF, K5 at ON. Plain shell + binutils, headless |
 | `test_ts_reader` | HoaLac `.ts` (dataset path, soft-skips) | MISB 0601 KLV pass + `VideoReader` open; `UAVLOC_TS_MAXFRAMES=100`, `UAVLOC_TS_SHOW=0` |

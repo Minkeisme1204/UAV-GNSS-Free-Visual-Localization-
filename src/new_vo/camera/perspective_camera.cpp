@@ -1,5 +1,10 @@
 #include "uavloc/new_vo/camera/perspective_camera.h"
 
+#include <algorithm>
+#include <vector>
+
+#include <spdlog/spdlog.h>
+
 namespace uavloc {
 namespace vo {
 namespace camera {
@@ -21,7 +26,39 @@ PerspectiveCamera::PerspectiveCamera(const sensor::CameraModel& model)
     name_ = in.camera_id;
     setup_type_ = SetupType::Monocular;
     model_type_ = ModelType::Perspective;
-    img_bounds_ = ImageBounds(0.0f, static_cast<float>(cols_), 0.0f, static_cast<float>(rows_));
+    // Must stay last: compute_image_bounds() dispatches to undistort_point(),
+    // which reads fx_/fy_/cx_/cy_ and model_ (mirrors stella's ctor ordering).
+    img_bounds_ = compute_image_bounds();
+}
+
+ImageBounds PerspectiveCamera::compute_image_bounds() const {
+    spdlog::debug("compute image bounds");
+
+    // distCoeffs() order: k1, k2, p1, p2, k3
+    const Eigen::Matrix<double, 5, 1>& dist = model_.distCoeffs();
+
+    if (dist(0) == 0.0 && dist(1) == 0.0 && dist(2) == 0.0 && dist(3) == 0.0 && dist(4) == 0.0) {
+        // any distortion does not exist
+        return ImageBounds(0.0f, static_cast<float>(cols_), 0.0f, static_cast<float>(rows_));
+    }
+
+    // distortion exists
+
+    // corner coordinates: (x, y) = (col, row)
+    const float cols = static_cast<float>(cols_);
+    const float rows = static_cast<float>(rows_);
+    const std::vector<cv::KeyPoint> corners{cv::KeyPoint(0.0f, 0.0f, 1.0f),   // left top
+                                            cv::KeyPoint(cols, 0.0f, 1.0f),   // right top
+                                            cv::KeyPoint(0.0f, rows, 1.0f),   // left bottom
+                                            cv::KeyPoint(cols, rows, 1.0f)};  // right bottom
+
+    std::vector<cv::KeyPoint> undist_corners;
+    undistort_keypoints(corners, undist_corners);
+
+    return ImageBounds(std::min(undist_corners.at(0).pt.x, undist_corners.at(2).pt.x),
+                       std::max(undist_corners.at(1).pt.x, undist_corners.at(3).pt.x),
+                       std::min(undist_corners.at(0).pt.y, undist_corners.at(1).pt.y),
+                       std::max(undist_corners.at(2).pt.y, undist_corners.at(3).pt.y));
 }
 
 cv::Point2f PerspectiveCamera::undistort_point(const cv::Point2f& dist_pt) const {

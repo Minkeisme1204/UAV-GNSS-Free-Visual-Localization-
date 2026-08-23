@@ -2,6 +2,7 @@
 
 #include "uavloc/anchor/anchor_query.h"
 #include "uavloc/core/extrapolator.h"
+#include "uavloc/core/rate_estimator.h"
 #include "uavloc/fusion/fusion_module.h"
 #include "uavloc/sensor/geo_reference.h"
 #include "uavloc/sensor/telemetry_data.h"
@@ -159,7 +160,8 @@ private:
 
 class SystemManager::Impl {
 public:
-    explicit Impl(const SystemConfig& config) : config_(config) {}
+    explicit Impl(const SystemConfig& config)
+        : config_(config), rate_(config.stats_fps_window_sec) {}
 
     ~Impl() { stop(); }
 
@@ -837,6 +839,10 @@ public:
             q.yaw_deg         = fd.has_telemetry ? fd.telemetry.heading_deg : 0.0;
             q.gimbal_pan_deg  = fd.has_telemetry ? fd.telemetry.gimbal_pan_deg : 0.0;
             q.gimbal_tilt_deg = fd.has_telemetry ? fd.telemetry.gimbal_tilt_deg : 0.0;
+            // Full attitude, not just heading: a BEV-rectifying consumer needs
+            // roll and pitch too, and they are right here in the same struct.
+            q.roll_deg        = fd.has_telemetry ? fd.telemetry.roll_deg : 0.0;
+            q.pitch_deg       = fd.has_telemetry ? fd.telemetry.pitch_deg : 0.0;
             const char* reason_str =
                 q.reason == anchor::AnchorRequestReason::REINIT ? "REINIT"
                                                                : "KEYFRAME";
@@ -1179,6 +1185,7 @@ private:
             (proc_sec_total_ > 0.0)
                 ? static_cast<double>(stats_.frames_processed) / proc_sec_total_
                 : 0.0;
+        rate_.add(std::chrono::steady_clock::now(), dt_sec);
     }
 
     SystemStats stats_snapshot() const {
@@ -1190,6 +1197,15 @@ private:
         SystemStats out  = stats_;
         out.queue_depth  = depth;
         out.state        = state_.load();
+
+        // The windowed figures are derived at SNAPSHOT time on purpose, not
+        // cached in updateStats(): a stalled pipeline stops calling
+        // updateStats() altogether, so a cached value would freeze at its last
+        // reading while this one decays to 0 as the window empties.
+        const RateEstimator::Sample rs = rate_.snapshot(std::chrono::steady_clock::now());
+        out.fps_windowed   = rs.fps;
+        out.proc_ms_mean   = rs.proc_ms_mean;
+        out.fps_window_sec = rate_.window_sec();
         return out;
     }
 
@@ -1270,6 +1286,9 @@ private:
     mutable std::mutex  stats_mutex_;
     SystemStats         stats_;
     double              proc_sec_total_ = 0.0;
+    //! Live (trailing-window) throughput. Guarded by stats_mutex_ — the class
+    //! is deliberately not thread-safe on its own.
+    RateEstimator       rate_;
     vo::VOTrackingState prev_vo_state_  = vo::VOTrackingState::NOT_INITIALIZED;
     bool                had_first_init_ = false;
     bool                pending_reinit_ = false;

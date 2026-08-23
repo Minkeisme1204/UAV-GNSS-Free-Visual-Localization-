@@ -77,6 +77,9 @@ public:
     //! (module/keyframe_inserter.cc, module/local_map_cleaner.cc).
     float depth_thr_ = 0.0;
 
+    //! Valid image region after undistortion (mirrors stella_vslam::camera::base).
+    virtual ImageBounds compute_image_bounds() const = 0;
+
     //! Undistort a distorted point
     virtual cv::Point2f undistort_point(const cv::Point2f& dist_pt) const = 0;
 

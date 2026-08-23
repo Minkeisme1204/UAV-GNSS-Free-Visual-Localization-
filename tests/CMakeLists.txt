@@ -204,6 +204,22 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_viewer_run_policy.cpp)
     set_tests_properties(test_viewer_run_policy PROPERTIES TIMEOUT 60)
 endif()
 
+# Pure unit test of core::RateEstimator, the trailing-window throughput
+# estimator behind SystemStats::fps_windowed. NOT gated on ENABLE_VIEWER: the
+# estimator lives in core, and the property that matters — a stalled pipeline
+# decaying to 0 instead of freezing — is arithmetic over synthetic time points,
+# with no dataset, no threads and no real sleeps.
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_rate_estimator.cpp)
+    add_executable(test_rate_estimator test_rate_estimator.cpp)
+    target_link_libraries(test_rate_estimator PRIVATE uavloc)
+    set_target_properties(test_rate_estimator PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${TEST_OUTPUT_DIR}
+    )
+    add_test(NAME test_rate_estimator COMMAND test_rate_estimator)
+    # Synthetic time points only: milliseconds of work. The timeout is a net.
+    set_tests_properties(test_rate_estimator PROPERTIES TIMEOUT 60)
+endif()
+
 # ── anchor (M1: AnchorInterface + the groundtruth-driven FakeAnchor) ─────────
 # Self-contained: the test WRITES its own synthetic groundtruth CSV into the
 # working directory and deletes it again, so it needs no dataset. Multi-threaded
@@ -252,6 +268,8 @@ endif()
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_full_flight.cpp)
     add_executable(test_full_flight test_full_flight.cpp)
     target_link_libraries(test_full_flight PRIVATE uavloc uavloc_test_eval)
+    target_compile_definitions(test_full_flight PRIVATE
+        UAVLOC_HAVE_VPR=$<BOOL:${UAVLOC_HAVE_VPR}>)
     target_include_directories(test_full_flight PRIVATE ${CMAKE_SOURCE_DIR}/src/debug_viewer)
     target_compile_definitions(test_full_flight PRIVATE
         UAVLOC_MISSION_CONFIG_PATH="${CMAKE_SOURCE_DIR}/config/uavloc_yenbai500m.yaml"
@@ -309,13 +327,19 @@ if(ENABLE_VIEWER AND Iridescence_FOUND)
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_vo_vpr_anchor_viewer.cpp)
         add_executable(test_vo_vpr_anchor_viewer test_vo_vpr_anchor_viewer.cpp)
         target_link_libraries(test_vo_vpr_anchor_viewer PRIVATE uavloc uavloc_test_eval)
+        # UAVLOC_HAVE_VPR là biến CMake, không phải macro — driver cần nó ở dạng
+        # macro để rẽ nhánh `--anchor vpr` mà vẫn build được khi module VPR tắt.
         target_compile_definitions(test_vo_vpr_anchor_viewer PRIVATE
             UAVLOC_MISSION_CONFIG_PATH="${CMAKE_SOURCE_DIR}/config/uavloc_yenbai800m_newvo.yaml"
+            UAVLOC_HAVE_VPR=$<BOOL:${UAVLOC_HAVE_VPR}>
         )
         set_target_properties(test_vo_vpr_anchor_viewer PROPERTIES
             RUNTIME_OUTPUT_DIRECTORY ${TEST_OUTPUT_DIR}
         )
-        add_test(NAME test_vo_vpr_anchor_viewer COMMAND test_vo_vpr_anchor_viewer)
+        # ctest chạy nhánh FAKE: nó tái lập được và không đòi artifact của satVPR.
+        # Nhánh thật chạy tay: --anchor vpr.
+        add_test(NAME test_vo_vpr_anchor_viewer
+                 COMMAND test_vo_vpr_anchor_viewer --anchor fake)
         set_tests_properties(test_vo_vpr_anchor_viewer PROPERTIES
             ENVIRONMENT "DISPLAY=;WAYLAND_DISPLAY="
             TIMEOUT 300
@@ -444,4 +468,49 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/build_hygiene.sh)
                 $<TARGET_FILE:uavloc>
     )
     set_tests_properties(test_build_hygiene PROPERTIES TIMEOUT 120)
+endif()
+
+# ── vpr: chỉ kiểm phần GHÉP, số học có bộ parity riêng ở repo satvpr_core ──────
+if(UAVLOC_HAVE_VPR AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_vpr.cpp)
+    add_executable(test_vpr test_vpr.cpp)
+    target_link_libraries(test_vpr PRIVATE uavloc yaml-cpp::yaml-cpp ${OpenCV_LIBS})
+    target_compile_definitions(test_vpr PRIVATE SATVPR_DATA_ROOT="${SATVPR_ROOT}")
+    set_target_properties(test_vpr PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${TEST_OUTPUT_DIR})
+    add_test(NAME test_vpr COMMAND test_vpr)
+    set_tests_properties(test_vpr PROPERTIES TIMEOUT 300)
+endif()
+
+if(UAVLOC_HAVE_VPR AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_vpr_anchor.cpp)
+    add_executable(test_vpr_anchor test_vpr_anchor.cpp)
+    target_link_libraries(test_vpr_anchor PRIVATE uavloc yaml-cpp::yaml-cpp ${OpenCV_LIBS})
+    target_compile_definitions(test_vpr_anchor PRIVATE SATVPR_DATA_ROOT="${SATVPR_ROOT}")
+    set_target_properties(test_vpr_anchor PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${TEST_OUTPUT_DIR})
+    add_test(NAME test_vpr_anchor COMMAND test_vpr_anchor)
+    set_tests_properties(test_vpr_anchor PROPERTIES TIMEOUT 300)
+endif()
+
+if(UAVLOC_HAVE_VPR AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_vpr_fine.cpp)
+    add_executable(test_vpr_fine test_vpr_fine.cpp)
+    target_link_libraries(test_vpr_fine PRIVATE uavloc yaml-cpp::yaml-cpp ${OpenCV_LIBS})
+    target_compile_definitions(test_vpr_fine PRIVATE SATVPR_DATA_ROOT="${SATVPR_ROOT}")
+    set_target_properties(test_vpr_fine PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${TEST_OUTPUT_DIR})
+    # yenbai_800m: bộ DUY NHẤT đã nâng lên .vprdb v2 (có kho ảnh ô). mun_ds6 còn
+    # v1 nên khớp tinh sẽ tắt — nhánh đó có test riêng trong chính binary này.
+    add_test(NAME test_vpr_fine COMMAND test_vpr_fine yenbai_800m 30)
+    set_tests_properties(test_vpr_fine PROPERTIES TIMEOUT 600)
+endif()
+
+# ── test_vpr_flow: driver ĐO trên dữ liệu thật, không phải cổng pass/fail ─────
+# Mặc định trỏ vào bộ dữ liệu của satvpr_core; mọi thứ ghi đè được bằng tham số
+# dòng lệnh, nên chạy được trên bất kỳ eval set nào có đủ query_latlon.csv,
+# queries/, pca.yml và <tên>.vprdb. Thiếu dữ liệu -> soft-skip.
+if(UAVLOC_HAVE_VPR AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test_vpr_flow.cpp)
+    add_executable(test_vpr_flow test_vpr_flow.cpp)
+    target_link_libraries(test_vpr_flow PRIVATE uavloc ${OpenCV_LIBS})
+    target_compile_definitions(test_vpr_flow PRIVATE
+        DEFAULT_DATASET_DIR="${SATVPR_ROOT}/dataset/eval/mun_ds6"
+        DEFAULT_WEIGHTS_DIR="${SATVPR_ROOT}/.weights")
+    set_target_properties(test_vpr_flow PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${TEST_OUTPUT_DIR})
+    add_test(NAME test_vpr_flow COMMAND test_vpr_flow --queries 20 --yaw-offset 180)
+    set_tests_properties(test_vpr_flow PROPERTIES TIMEOUT 600)
 endif()

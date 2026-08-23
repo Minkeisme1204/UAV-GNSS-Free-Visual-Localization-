@@ -13,3 +13,6 @@ build_off/*
 .env
 .venv
 .code-review-graph 
+CURRENT_STATE_VPR.md
+full_flight.csv
+test_*.csv
