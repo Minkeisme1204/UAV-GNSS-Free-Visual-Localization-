@@ -16,3 +16,7 @@ build_off/*
 CURRENT_STATE_VPR.md
 full_flight.csv
 test_*.csv
+out/
+build_prev_*
+build*/
+build_*/
